@@ -1,0 +1,8 @@
+# DriverLib_King_orz 为独立仓库，不纳入本仓库
+DriverLib_King_orz/
+
+# 嵌入式 git 克隆（可重新 clone，见 stm32-mw-openbl）
+stm32-mw-openbl/
+
+# 构建产物
+build/

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Recurse -Depth 1)",
+      "Bash(Select-Object Mode, Name)",
+      "Bash(arm-none-eabi-gcc --version)"
+    ]
+  }
+}
