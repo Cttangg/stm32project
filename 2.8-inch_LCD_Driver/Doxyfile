@@ -1,0 +1,20 @@
+# Doxygen configuration for 2.8-inch LCD Driver Library
+# 生成: doxygen Doxyfile  ->  输出到 docs/ (已 gitignore)
+
+PROJECT_NAME           = "2.8-inch LCD Driver Library"
+PROJECT_BRIEF          = "STM32F407 TFT-LCD (FSMC) + 电阻触摸 (XPT2046) 可移植驱动组件库 v1.0.0"
+OUTPUT_DIRECTORY       = docs
+INPUT                  = Core/Lib
+RECURSIVE              = YES
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+SOURCE_BROWSER         = YES
+JAVADOC_AUTOBRIEF      = YES
+
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES

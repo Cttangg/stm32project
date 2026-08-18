@@ -25,6 +25,7 @@
 #include "usart.h"
 #include "lcd.h"
 #include "touch.h"
+#include "self_test.h"
 #include "app_boot_interface.h"
 #include "image2.h"
 #include "image3.h"
@@ -39,7 +40,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* 上电自检: 1=初始化完成后执行 LCD/TP/UART 自检 (结果经串口输出) */
+#define SELF_TEST_ENABLE 0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,12 +54,9 @@ UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 DMA_HandleTypeDef hdma_usart1_tx;
 
-SRAM_HandleTypeDef hsram1;
-
 /* USER CODE BEGIN PV */
 static uint32_t g_last_hello = 0;
 static uint8_t  g_img_idx = 0;
-static uint8_t  g_touch_down = 0;
 static const u16 * const IMAGES[] = { test2_image, test3_image };
 /* USER CODE END PV */
 
@@ -66,7 +65,6 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
-static void MX_FSMC_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -132,7 +130,6 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
-  MX_FSMC_Init();
   /* USER CODE BEGIN 2 */
 
   /* 通用串口库: 注册并打开 USART1 (RX DMA CIRCULAR + IDLE, TX DMA 链式) */
@@ -170,6 +167,11 @@ int main(void)
   TP_Init();
   LCD_ShowString(20, 80, 200, 16, 16, "Touch calibrated");
 
+  /* 上电自检 (SELF_TEST_ENABLE=1 时执行, 结果经串口输出) */
+#if (SELF_TEST_ENABLE == 1)
+  LIB_SelfTest(UART_P1);
+#endif
+
   LCD_ShowString(20, 100, 200, 16, 16, "Touch to switch img");
 
   /* 显示第一张图 */
@@ -188,15 +190,21 @@ int main(void)
     /* 串口任务: 环形缓冲 → 帧解析 → 回传回调 */
     UART_Task();
 
-    /* 触摸屏当按键: 点一下(按下+松开)切换下一张图片 */
-    if (TP_Scan(0) == 0) {
-        if (g_touch_down) {
-            g_touch_down = 0;
-            g_img_idx = (uint8_t)((g_img_idx + 1) % (sizeof(IMAGES) / sizeof(IMAGES[0])));
-            LCD_ShowImage(0, 0, 240, 320, IMAGES[g_img_idx]);
-        }
-    } else {
-        g_touch_down = 1;
+    /* 触摸手势 (上层只消费手势事件): 单击切图, 长按白屏, 滑动提示 */
+    switch (TP_GetGesture()) {
+    case TOUCH_EVENT_SINGLE_CLICK:
+        g_img_idx = (uint8_t)((g_img_idx + 1) % (sizeof(IMAGES) / sizeof(IMAGES[0])));
+        LCD_ShowImage(0, 0, lcddev.width, lcddev.height, IMAGES[g_img_idx]);
+        break;
+    case TOUCH_EVENT_LONG_PRESS:
+        LCD_Clear(WHITE);
+        break;
+    case TOUCH_EVENT_SWIPE:
+        POINT_COLOR = RED;
+        LCD_ShowString(20, 300, 200, 16, 16, "Swipe!");
+        break;
+    default:
+        break;
     }
 
     /* 定时发送 hello (每 1s) */
@@ -313,7 +321,6 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -326,84 +333,9 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, BLK_Pin|T_CS_Pin|T_CLK_Pin|T_MOSI_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : T_PEN_Pin */
-  GPIO_InitStruct.Pin = T_PEN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(T_PEN_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : BLK_Pin T_CS_Pin T_CLK_Pin T_MOSI_Pin */
-  GPIO_InitStruct.Pin = BLK_Pin|T_CS_Pin|T_CLK_Pin|T_MOSI_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : T_MISO_Pin */
-  GPIO_InitStruct.Pin = T_MISO_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(T_MISO_GPIO_Port, &GPIO_InitStruct);
-
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
-}
-
-/* FSMC initialization function */
-static void MX_FSMC_Init(void)
-{
-
-  /* USER CODE BEGIN FSMC_Init 0 */
-
-  /* USER CODE END FSMC_Init 0 */
-
-  FSMC_NORSRAM_TimingTypeDef Timing = {0};
-
-  /* USER CODE BEGIN FSMC_Init 1 */
-
-  /* USER CODE END FSMC_Init 1 */
-
-  /** Perform the SRAM1 memory initialization sequence
-  */
-  hsram1.Instance = FSMC_NORSRAM_DEVICE;
-  hsram1.Extended = FSMC_NORSRAM_EXTENDED_DEVICE;
-  /* hsram1.Init */
-  hsram1.Init.NSBank = FSMC_NORSRAM_BANK1;
-  hsram1.Init.DataAddressMux = FSMC_DATA_ADDRESS_MUX_DISABLE;
-  hsram1.Init.MemoryType = FSMC_MEMORY_TYPE_SRAM;
-  hsram1.Init.MemoryDataWidth = FSMC_NORSRAM_MEM_BUS_WIDTH_16;
-  hsram1.Init.BurstAccessMode = FSMC_BURST_ACCESS_MODE_DISABLE;
-  hsram1.Init.WaitSignalPolarity = FSMC_WAIT_SIGNAL_POLARITY_LOW;
-  hsram1.Init.WrapMode = FSMC_WRAP_MODE_DISABLE;
-  hsram1.Init.WaitSignalActive = FSMC_WAIT_TIMING_BEFORE_WS;
-  hsram1.Init.WriteOperation = FSMC_WRITE_OPERATION_ENABLE;
-  hsram1.Init.WaitSignal = FSMC_WAIT_SIGNAL_DISABLE;
-  hsram1.Init.ExtendedMode = FSMC_EXTENDED_MODE_DISABLE;
-  hsram1.Init.AsynchronousWait = FSMC_ASYNCHRONOUS_WAIT_DISABLE;
-  hsram1.Init.WriteBurst = FSMC_WRITE_BURST_DISABLE;
-  hsram1.Init.PageSize = FSMC_PAGE_SIZE_NONE;
-  /* Timing */
-  Timing.AddressSetupTime = 15;
-  Timing.AddressHoldTime = 15;
-  Timing.DataSetupTime = 255;
-  Timing.BusTurnAroundDuration = 15;
-  Timing.CLKDivision = 16;
-  Timing.DataLatency = 17;
-  Timing.AccessMode = FSMC_ACCESS_MODE_A;
-  /* ExtTiming */
-
-  if (HAL_SRAM_Init(&hsram1, &Timing, NULL) != HAL_OK)
-  {
-    Error_Handler( );
-  }
-
-  /* USER CODE BEGIN FSMC_Init 2 */
-
-  /* USER CODE END FSMC_Init 2 */
 }
 
 /* USER CODE BEGIN 4 */

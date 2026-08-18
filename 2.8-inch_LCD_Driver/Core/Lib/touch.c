@@ -3,42 +3,59 @@
 #include "delay.h"
 #include <stdlib.h>
 #include <math.h>
-//////////////////////////////////////////////////////////////////////////////////	 
 
-/* 板载无 24CXX EEPROM: 校准数据不保存, 每次上电重新校准 */
+/**
+ ******************************************************************************
+ * @file    touch.c
+ * @brief   电阻触摸屏驱动实现 — 软件模拟 SPI
+ *
+ *          支持 ADS7843/7846/UH7843/7846/XPT2046/TSC2046/OTT2001A 等驱动 IC,
+ *          由正点原子 STM32F4 触摸驱动 (V1.1 20140721) 改造而来:
+ *           - 修正 MDK -O2 优化下触摸数据读取失败 (TP_Write_Byte 内加延时)
+ *           - 板载无 24CXX EEPROM, 校准数据不保存, 使用预存校准参数
+ *
+ * 采样策略:
+ *   - TP_Read_XOY(): 多次采样排序去极值取平均, 抑制随机噪声
+ *   - TP_Read_XY2(): 连续两次采样偏差校验 (±ERR_RANGE), 提高准确度
+ ******************************************************************************
+ */
+
+/* 板载无 24CXX EEPROM: 校准数据不保存, 每次上电重新校准.
+ * 以下为模拟 EEPROM 接口 (空实现) */
 static u8  AT24CXX_ReadOneByte(u16 addr)      { (void)addr; return 0; }
 static void AT24CXX_WriteOneByte(u16 addr, u8 v) { (void)addr; (void)v; }
 static u32 AT24CXX_ReadLenByte(u16 addr, u8 n)   { (void)addr; (void)n; return 0; }
 static void AT24CXX_WriteLenByte(u16 addr, u32 v, u8 n) { (void)addr; (void)v; (void)n; }
 
 
-//触摸屏驱动（支持ADS7843/7846/UH7843/7846/XPT2046/TSC2046/OTT2001A等） 代码	   
-//STM32F4工程模板-库函数版本
-//淘宝店铺：http://mcudev.taobao.com								   
-//********************************************************************************
-//修改说明
-//V1.1 20140721
-//修正MDK在-O2优化时,触摸屏数据无法读取的bug.在TP_Write_Byte函数添加一个延时,解决问题.
+/* 历史说明 (正点原子 STM32F4 触摸驱动 V1.1 20140721):
+ * 修正 MDK -O2 优化时触摸屏数据无法读取的 bug: 在 TP_Write_Byte 函数中添加延时解决 */
 //////////////////////////////////////////////////////////////////////////////////
 
+/** 全局触摸设备实例: 绑定 init/scan/adjust 回调 */
 _m_tp_dev tp_dev=
 {
 	.init   = TP_Init,
 	.scan   = TP_Scan,
 	.adjust = TP_Adjust,
 };					
-//默认为touchtype=0的数据.
+/** 读 X 坐标指令 (默认 touchtype=0) */
 u8 CMD_RDX=0XD0;
+/** 读 Y 坐标指令 (默认 touchtype=0) */
 u8 CMD_RDY=0X90;
 
-/* 预存四角校准原始值: 左上(20,20), 右上(220,20), 左下(20,300), 右下(220,300) */
-static const u16 TP_PRESET_CAL[4][2] = {
-    {548, 302}, {3555, 404}, {443, 3606}, {3239, 3675},
-};
+#if (TP_PEN_INT_ENABLE == 1)
+/** PEN 按下事件标志 (ISR 置位, TP_Scan 消费) */
+static volatile u8 g_tp_pen_down;
+/** PEN 释放事件标志 (ISR 置位, TP_Scan 消费) */
+static volatile u8 g_tp_pen_up;
+#endif
  	 			    					   
-//SPI写数据
-//向触摸屏IC写入1byte数据    
-//num:要写入的数据
+/**
+ * @brief  软件 SPI 写入 1 字节 (MSB 先行, 时钟上升沿采样)
+ * @param  num: 要写入的数据
+ * @note   含 1us 空转延时, 兼容 MDK -O2 优化
+ */
 void TP_Write_Byte(u8 num)    
 {  
 	u8 count=0;   
@@ -52,10 +69,12 @@ void TP_Write_Byte(u8 num)
 		TP_TCLK(GPIO_PIN_SET);		//上升沿有效	        
 	}		 			    
 } 		 
-//SPI读数据 
-//从触摸屏IC读取adc值
-//CMD:指令
-//返回值:读到的数据	   
+/**
+ * @brief  软件 SPI 读取 12 位 ADC 转换值
+ * @param  CMD: 控制指令 (如 CMD_RDX/CMD_RDY)
+ * @retval 读到的数据 (高 12 位有效, 已右移 4 位)
+ * @note   内含 ADS7846 最长转换时间 (6us) 等待与 O2 优化兼容延时
+ */
 u16 TP_Read_AD(u8 CMD)	  
 { 	 
 	u8 count=0; 	  
@@ -82,23 +101,24 @@ u16 TP_Read_AD(u8 CMD)
 	TP_TCS(GPIO_PIN_SET);		//释放片选	 
 	return(Num);   
 }
-//读取一个坐标值(x或者y)
-//连续读取READ_TIMES次数据,对这些数据升序排列,
-//然后去掉最低和最高LOST_VAL个数,取平均值 
-//xy:指令（CMD_RDX/CMD_RDY）
-//返回值:读到的数据
-#define READ_TIMES 5 	//读取次数
-#define LOST_VAL 1	  	//丢弃值
+/**
+ * @brief  读取一个轴的坐标值 (X 或 Y)
+ *         连续采样 READ_TIMES 次并升序排序, 去掉最高最低各 LOST_VAL 个
+ *         极值后取平均, 以抑制随机噪声
+ * @param  xy: 指令 (CMD_RDX / CMD_RDY)
+ * @retval 滤波后的读数
+ * @note   采样次数/丢弃个数由 touch_conf.h 的 TP_READ_TIMES/TP_LOST_VAL 配置
+ */
 u16 TP_Read_XOY(u8 xy)
 {
 	u16 i, j;
-	u16 buf[READ_TIMES];
+	u16 buf[TP_READ_TIMES];
 	u16 sum=0;
 	u16 temp;
-	for(i=0;i<READ_TIMES;i++)buf[i]=TP_Read_AD(xy);		 		    
-	for(i=0;i<READ_TIMES-1; i++)//排序
+	for(i=0;i<TP_READ_TIMES;i++)buf[i]=TP_Read_AD(xy);		 		    
+	for(i=0;i<TP_READ_TIMES-1; i++)//排序
 	{
-		for(j=i+1;j<READ_TIMES;j++)
+		for(j=i+1;j<TP_READ_TIMES;j++)
 		{
 			if(buf[i]>buf[j])//升序排列
 			{
@@ -109,30 +129,34 @@ u16 TP_Read_XOY(u8 xy)
 		}
 	}	  
 	sum=0;
-	for(i=LOST_VAL;i<READ_TIMES-LOST_VAL;i++)sum+=buf[i];
-	temp=sum/(READ_TIMES-2*LOST_VAL);
+	for(i=TP_LOST_VAL;i<TP_READ_TIMES-TP_LOST_VAL;i++)sum+=buf[i];
+	temp=sum/(TP_READ_TIMES-2*TP_LOST_VAL);
 	return temp;   
 } 
-//读取x,y坐标
-//最小值不能少于100.
-//x,y:读取到的坐标值
-//返回值:0,失败;1,成功。
+/**
+ * @brief  读取 X/Y 坐标
+ * @param  x: 读取到的 X 坐标指针
+ * @param  y: 读取到的 Y 坐标指针
+ * @retval 0: 失败; 1: 成功
+ */
 u8 TP_Read_XY(u16 *x,u16 *y)
 {
 	u16 xtemp,ytemp;			 	 		  
 	xtemp=TP_Read_XOY(CMD_RDX);
 	ytemp=TP_Read_XOY(CMD_RDY);	  												   
-	//if(xtemp<100||ytemp<100)return 0;//读数失败
+	if(xtemp<TP_READ_MIN||ytemp<TP_READ_MIN)return 0;//读数失败 (阈值见 touch_conf.h)
 	*x=xtemp;
 	*y=ytemp;
 	return 1;//读数成功
 }
-//连续2次读取触摸屏IC,且这两次的偏差不能超过
-//ERR_RANGE,满足条件,则认为读数正确,否则读数错误.	   
-//该函数能大大提高准确度
-//x,y:读取到的坐标值
-//返回值:0,失败;1,成功。
-#define ERR_RANGE 50 //误差范围 
+/**
+ * @brief  双采样校验读坐标
+ *         连续 2 次读取触摸屏 IC, 两次偏差不超过 TP_ERR_RANGE 才认为读数
+ *         正确并取平均, 否则返回失败. 能大幅提高准确度
+ * @param  x: 读取到的坐标值指针
+ * @param  y: 读取到的坐标值指针
+ * @retval 0: 失败; 1: 成功
+ */
 u8 TP_Read_XY2(u16 *x,u16 *y) 
 {
 	u16 x1,y1;
@@ -142,20 +166,20 @@ u8 TP_Read_XY2(u16 *x,u16 *y)
     if(flag==0)return(0);
     flag=TP_Read_XY(&x2,&y2);	   
     if(flag==0)return(0);   
-    if(((x2<=x1&&x1<x2+ERR_RANGE)||(x1<=x2&&x2<x1+ERR_RANGE))//前后两次采样在+-50内
-    &&((y2<=y1&&y1<y2+ERR_RANGE)||(y1<=y2&&y2<y1+ERR_RANGE)))
+    if(((x2<=x1&&x1<x2+TP_ERR_RANGE)||(x1<=x2&&x2<x1+TP_ERR_RANGE))//前后两次采样在+-ERR_RANGE内
+    &&((y2<=y1&&y1<y2+TP_ERR_RANGE)||(y1<=y2&&y2<y1+TP_ERR_RANGE)))
     {
         *x=(x1+x2)/2;
         *y=(y1+y2)/2;
         return 1;
     }else return 0;	  
 }  
-//////////////////////////////////////////////////////////////////////////////////		  
-//与LCD部分有关的函数  
-//画一个触摸点
-//用来校准用的
-//x,y:坐标
-//color:颜色
+/**
+ * @brief  画一个触摸校准点 (十字线 + 中心圈)
+ * @param  x: 横坐标
+ * @param  y: 纵坐标
+ * @param  color: 颜色
+ */
 void TP_Drow_Touch_Point(u16 x,u16 y,u16 color)
 {
 	POINT_COLOR=color;
@@ -167,9 +191,12 @@ void TP_Drow_Touch_Point(u16 x,u16 y,u16 color)
 	LCD_DrawPoint(x-1,y-1);
 	LCD_Draw_Circle(x,y,6);//画中心圈
 }	  
-//画一个大点(2*2的点)		   
-//x,y:坐标
-//color:颜色
+/**
+ * @brief  画一个大点 (2x2 像素)
+ * @param  x: 横坐标
+ * @param  y: 纵坐标
+ * @param  color: 颜色
+ */
 void TP_Draw_Big_Point(u16 x,u16 y,u16 color)
 {	    
 	POINT_COLOR=color;
@@ -178,46 +205,139 @@ void TP_Draw_Big_Point(u16 x,u16 y,u16 color)
 	LCD_DrawPoint(x,y+1);
 	LCD_DrawPoint(x+1,y+1);	 	  	
 }						  
-//////////////////////////////////////////////////////////////////////////////////		  
-//触摸按键扫描
-//tp:0,屏幕坐标;1,物理坐标(校准等特殊场合用)
-//返回值:当前触屏状态.
-//0,触屏无触摸;1,触屏有触摸
+/**
+ * @brief  触摸扫描 (主循环周期调用)
+ * @param  tp: 0=输出屏幕坐标; 1=输出物理坐标 (校准等特殊场合用)
+ * @retval 当前触屏状态: 0=无触摸; 1=有触摸
+ * @note   当前坐标存入 tp_dev.x[0]/y[0], 按下瞬间坐标记录在 x[4]/y[4];
+ *         TP_PEN_INT_ENABLE=1 时由 PEN 中断事件驱动, 无按压时快速返回
+ */
 u8 TP_Scan(u8 tp)
-{			   
-	if(TP_PEN==GPIO_PIN_RESET)//有按键按下
+{
+#if (TP_PEN_INT_ENABLE == 1)
+	u16 xt,yt;
+	/* 释放事件 (上升沿) */
+	if(g_tp_pen_up)
 	{
-		if(tp)TP_Read_XY2(&tp_dev.x[0],&tp_dev.y[0]);//读取物理坐标
-		else if(TP_Read_XY2(&tp_dev.x[0],&tp_dev.y[0]))//读取屏幕坐标
-		{
-	 		tp_dev.x[0]=tp_dev.xfac*tp_dev.x[0]+tp_dev.xoff;//将结果转换为屏幕坐标
-			tp_dev.y[0]=tp_dev.yfac*tp_dev.y[0]+tp_dev.yoff;  
-	 	} 
-		if((tp_dev.sta&TP_PRES_DOWN)==0)//之前没有被按下
-		{		 
-			tp_dev.sta=TP_PRES_DOWN|TP_CATH_PRES;//按键按下  
-			tp_dev.x[4]=tp_dev.x[0];//记录第一次按下时的坐标
-			tp_dev.y[4]=tp_dev.y[0];  	   			 
-		}			   
-	}else
-	{
+		g_tp_pen_up=0;
+		g_tp_pen_down=0;
 		if(tp_dev.sta&TP_PRES_DOWN)//之前是被按下的
 		{
-			tp_dev.sta&=~(1<<7);//标记按键松开	
+			tp_dev.sta&=~(1<<7);//标记按键松开
 		}else//之前就没有被按下
 		{
 			tp_dev.x[4]=0;
 			tp_dev.y[4]=0;
 			tp_dev.x[0]=0xffff;
 			tp_dev.y[0]=0xffff;
-		}	    
+		}
+		return 0;
+	}
+	/* 无事件且未处于按压中: 仅当 PEN 物理释放时才快速返回
+	 * (按下但采样失败时不清除按压, 持续重试, 避免整次按压丢失) */
+	if(!g_tp_pen_down&&!(tp_dev.sta&TP_PRES_DOWN)&&(TP_PEN!=GPIO_PIN_RESET))return 0;
+	g_tp_pen_down=0;//消费按下事件; 按压期间每轮持续采样
+	if(TP_Read_XY2(&xt,&yt))//读数成功
+	{
+		if(tp)//物理坐标 (校准等特殊场合用)
+		{
+			tp_dev.x[0]=xt;
+			tp_dev.y[0]=yt;
+		}else//转换为屏幕坐标
+		{
+			tp_dev.x[0]=(u16)(tp_dev.xfac*xt+tp_dev.xoff);
+			tp_dev.y[0]=(u16)(tp_dev.yfac*yt+tp_dev.yoff);
+		}
+		if((tp_dev.sta&TP_PRES_DOWN)==0)//之前没有被按下
+		{
+			tp_dev.sta=TP_PRES_DOWN|TP_CATH_PRES;//按键按下
+			tp_dev.x[4]=tp_dev.x[0];//记录第一次按下时的坐标
+			tp_dev.y[4]=tp_dev.y[0];
+		}
+	}else//读数失败 (通信异常/阈值以下): 坐标置无效, 不产生按压事件
+	{
+		tp_dev.x[0]=0xffff;
+		tp_dev.y[0]=0xffff;
+		tp_dev.sta&=~(TP_CATH_PRES|TP_PRES_DOWN);
 	}
 	return tp_dev.sta&TP_PRES_DOWN;//返回当前的触屏状态
-}	  
-//////////////////////////////////////////////////////////////////////////	 
-//保存在EEPROM里面的地址区间基址,占用13个字节(RANGE:SAVE_ADDR_BASE~SAVE_ADDR_BASE+12)
+#else
+	u16 xt,yt;
+	if(TP_PEN==GPIO_PIN_RESET)//有按键按下
+	{
+		if(TP_Read_XY2(&xt,&yt))//读数成功
+		{
+			if(tp)//物理坐标 (校准等特殊场合用)
+			{
+				tp_dev.x[0]=xt;
+				tp_dev.y[0]=yt;
+			}else//转换为屏幕坐标
+			{
+				tp_dev.x[0]=(u16)(tp_dev.xfac*xt+tp_dev.xoff);
+				tp_dev.y[0]=(u16)(tp_dev.yfac*yt+tp_dev.yoff);
+			}
+			if((tp_dev.sta&TP_PRES_DOWN)==0)//之前没有被按下
+			{
+				tp_dev.sta=TP_PRES_DOWN|TP_CATH_PRES;//按键按下
+				tp_dev.x[4]=tp_dev.x[0];//记录第一次按下时的坐标
+				tp_dev.y[4]=tp_dev.y[0];
+			}
+		}else//读数失败 (通信异常/阈值以下): 坐标置无效, 不产生按压事件
+		{
+			tp_dev.x[0]=0xffff;
+			tp_dev.y[0]=0xffff;
+			tp_dev.sta&=~(TP_CATH_PRES|TP_PRES_DOWN);
+		}
+	}else
+	{
+		if(tp_dev.sta&TP_PRES_DOWN)//之前是被按下的
+		{
+			tp_dev.sta&=~(1<<7);//标记按键松开
+		}else//之前就没有被按下
+		{
+			tp_dev.x[4]=0;
+			tp_dev.y[4]=0;
+			tp_dev.x[0]=0xffff;
+			tp_dev.y[0]=0xffff;
+		}
+	}
+	return tp_dev.sta&TP_PRES_DOWN;//返回当前的触屏状态
+#endif
+}
+
+#if (TP_PEN_INT_ENABLE == 1)
+/**
+ * @brief  PEN 中断服务函数: 清除挂起位并记录按下/释放事件
+ * @note   由 EXTI5_10_IRQHandler 调用 (驱动内已提供弱定义入口)
+ */
+void TP_PenIRQHandler(void)
+{
+	__HAL_GPIO_EXTI_CLEAR_IT(TP_PEN_PIN);
+	if(HAL_GPIO_ReadPin(TP_PEN_GPIO, TP_PEN_PIN)==GPIO_PIN_RESET)g_tp_pen_down=1;
+	else g_tp_pen_up=1;
+}
+
+/**
+ * @brief  EXTI9-5 中断入口 (强定义: 覆盖 startup 的 Default_Handler 兜底)
+ * @note   startup_stm32f407xx.s 中 EXTI9_5_IRQHandler 为 .weak 指向
+ *         Default_Handler (死循环), 若此处仍用 __weak, 链接器会优先解析
+ *         到 startup 的兜底, 使能 EXTI 后直接死机. 故必须强定义.
+ *         若需在 CubeMX 中另行使能 EXTI9-5 引脚, 会与生成的强定义冲突
+ *         (链接报错), 此时应删除本定义, 在 CubeMX 生成的
+ *         EXTI9_5_IRQHandler USER CODE 段调用 TP_PenIRQHandler()
+ */
+void EXTI9_5_IRQHandler(void)
+{
+	TP_PenIRQHandler();
+}
+#endif
+/** EEPROM 校准数据基址 (占用 14 字节: SAVE_ADDR_BASE ~ SAVE_ADDR_BASE+13) */
 #define SAVE_ADDR_BASE 40
-//保存校准参数										    
+
+/**
+ * @brief  保存校准参数到 EEPROM
+ * @note   板载无 24CXX EEPROM, 实际为空操作
+ */
 void TP_Save_Adjdata(void)
 {
 	s32 temp;			 
@@ -235,9 +355,11 @@ void TP_Save_Adjdata(void)
 	temp=0X0A;//标记校准过了
 	AT24CXX_WriteOneByte(SAVE_ADDR_BASE+13,temp); 
 }
-//得到保存在EEPROM里面的校准值
-//返回值：1，成功获取数据
-//        0，获取失败，要重新校准
+/**
+ * @brief  从 EEPROM 读取校准值
+ * @retval 1: 成功获取校准数据; 0: 获取失败, 需重新校准
+ * @note   板载无 24CXX EEPROM, 恒返回 0
+ */
 u8 TP_Get_Adjdata(void)
 {					  
 	s32 tempfac;
@@ -266,10 +388,17 @@ u8 TP_Get_Adjdata(void)
 	}
 	return 0;
 }	 
-//提示字符串
+/** 校准提示字符串 (英文) */
 const char* const TP_REMIND_MSG_TBL="Please use the stylus click the cross on the screen.The cross will always move until the screen adjustment is completed.";
  					  
-//提示校准结果(各个参数)
+/**
+ * @brief  显示校准过程信息 (各采样点坐标与比例因子)
+ * @param  x0,y0: 第 1 点采样坐标
+ * @param  x1,y1: 第 2 点采样坐标
+ * @param  x2,y2: 第 3 点采样坐标
+ * @param  x3,y3: 第 4 点采样坐标
+ * @param  fac: 比例因子 (x100, 正常范围 95~105)
+ */
 void TP_Adj_Info_Show(u16 x0,u16 y0,u16 x1,u16 y1,u16 x2,u16 y2,u16 x3,u16 y3,u16 fac)
 {	  
 	POINT_COLOR=RED;
@@ -294,8 +423,12 @@ void TP_Adj_Info_Show(u16 x0,u16 y0,u16 x1,u16 y1,u16 x2,u16 y2,u16 x3,u16 y3,u1
 
 }
 		 
-//触摸屏校准代码
-//得到四个校准参数
+/**
+ * @brief  触摸屏四角校准
+ *         依次点击屏幕 4 个十字校准点, 通过对边/对角线距离校验与
+ *         比例因子检查, 计算 xfac/yfac/xoff/yoff 四个校准参数
+ * @note   10 秒内无按压操作则自动退出; 结果仅内存生效 (无 EEPROM)
+ */
 void TP_Adjust(void)
 {								 
 	u16 pos_temp[4][2];//坐标缓存值
@@ -446,9 +579,11 @@ void TP_Adjust(void)
 	 	} 
  	}
 }	 
-//触摸屏初始化  		    
-//返回值:0,没有进行校准
-//       1,进行过校准
+/**
+ * @brief  触摸屏初始化: GPIO 配置 + 装载预存校准参数
+ * @retval 0: 未进行四角校准 (使用预存校准值, 跳过校准流程)
+ * @note   如触摸不准, 可调用 TP_Adjust() 重新四角校准
+ */
 u8 TP_Init(void)
 {
 	GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -456,28 +591,39 @@ u8 TP_Init(void)
 	__HAL_RCC_GPIOB_CLK_ENABLE();
 	__HAL_RCC_GPIOC_CLK_ENABLE();
 
-	/* T_MISO (DOUT) PB14: input pull-up */
-	GPIO_InitStruct.Pin = GPIO_PIN_14;
+	/* T_MISO (DOUT): input pull-up */
+	GPIO_InitStruct.Pin = TP_MISO_PIN;
 	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
 	GPIO_InitStruct.Pull = GPIO_PULLUP;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+	HAL_GPIO_Init(TP_MISO_GPIO, &GPIO_InitStruct);
 
-	/* T_PEN PC5: input pull-up */
-	GPIO_InitStruct.Pin = GPIO_PIN_5;
+#if (TP_PEN_INT_ENABLE == 1)
+	/* T_PEN: EXTI 双边沿中断 (下降沿=按下, 上升沿=释放) */
+	GPIO_InitStruct.Pin = TP_PEN_PIN;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+	GPIO_InitStruct.Pull = GPIO_PULLUP;
+	HAL_GPIO_Init(TP_PEN_GPIO, &GPIO_InitStruct);
+	HAL_NVIC_SetPriority(TP_PEN_EXTI_IRQn, TP_PEN_EXTI_PRIO, 0);
+	HAL_NVIC_EnableIRQ(TP_PEN_EXTI_IRQn);
+#else
+	/* T_PEN: 输入上拉, 轮询检测 */
+	GPIO_InitStruct.Pin = TP_PEN_PIN;
 	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
 	GPIO_InitStruct.Pull = GPIO_PULLUP;
-	HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+	HAL_GPIO_Init(TP_PEN_GPIO, &GPIO_InitStruct);
+#endif
 
-	/* T_CS PB12 / T_SCK PB13 / T_MOSI PB15: output */
-	GPIO_InitStruct.Pin = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_15;
+	/* T_CS / T_SCK / T_MOSI: output */
+	GPIO_InitStruct.Pin = TP_CS_PIN | TP_SCK_PIN | TP_MOSI_PIN;
 	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
 	GPIO_InitStruct.Pull = GPIO_NOPULL;
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+	HAL_GPIO_Init(TP_CS_GPIO, &GPIO_InitStruct);
 
 	TP_Read_XY(&tp_dev.x[0], &tp_dev.y[0]);   /* first read to init */
 
-	/* 使用预存校准值, 跳过四角校准 */
+#if (TP_CAL_PRESET_ENABLE == 1)
+	/* 使用预存校准值, 跳过四角校准 (touch_conf.h) */
 	tp_dev.xfac = (float)(lcddev.width - 40) / (TP_PRESET_CAL[1][0] - TP_PRESET_CAL[0][0]);
 	tp_dev.xoff = (short)((lcddev.width - tp_dev.xfac * (TP_PRESET_CAL[1][0] + TP_PRESET_CAL[0][0])) / 2);
 	tp_dev.yfac = (float)(lcddev.height - 40) / (TP_PRESET_CAL[2][1] - TP_PRESET_CAL[0][1]);
@@ -485,6 +631,114 @@ u8 TP_Init(void)
 	tp_dev.touchtype = 0;
 	CMD_RDX = 0XD0;
 	CMD_RDY = 0X90;
+#else
+	/* 未启用预存校准 (新屏): 调用方应执行 TP_Adjust() 四角校准 */
+	tp_dev.xfac = 0; tp_dev.yfac = 0;
+	tp_dev.xoff = 0; tp_dev.yoff = 0;
+	tp_dev.touchtype = 0;
+	CMD_RDX = 0XD0;
+	CMD_RDY = 0X90;
+#endif
 	return 0;
+}
+
+/* ========================================================================= */
+/*  手势识别状态机 (上层只收到 4 种手势事件, 不暴露 DOWN/UP)                   */
+/* ========================================================================= */
+
+/** 手势引擎内部状态 */
+typedef struct {
+    TouchState_t state;     /* 当前状态 */
+    u16  start_x, start_y;  /* 按下起点坐标 (滑动判定基准) */
+    u32  press_tick;        /* 按下时刻 (最短按压/长按计时) */
+    u32  release_tick;      /* 候选释放时刻 (释放消抖计时, 0=未进入候选) */
+} TouchGesture_t;
+
+static TouchGesture_t g_gesture;
+
+TouchState_t TP_GetGestureState(void)
+{
+    return g_gesture.state;
+}
+
+TouchEvent_t TP_GetGesture(void)
+{
+    TouchEvent_t ev = TOUCH_EVENT_NONE;
+    u32 now = HAL_GetTick();
+    u8  pen_down;
+    u8  coord_ok;
+    u16 x, y;
+    int dx, dy;
+
+    /* 原始层采样: 更新 tp_dev 坐标与状态 (PEN 中断/轮询两种模式自适应) */
+    TP_Scan(0);
+    pen_down = (TP_PEN == GPIO_PIN_RESET);  /* 引脚级真实按压状态 */
+    x = tp_dev.x[0];
+    y = tp_dev.y[0];
+    /* 坐标有效性: 读数失败时 TP_Scan 会置 0xFFFF, 此时跳过移动判定 */
+    coord_ok = (x < lcddev.width) && (y < lcddev.height);
+
+    switch (g_gesture.state)
+    {
+    case TOUCH_STATE_IDLE:
+        if (pen_down && coord_ok) {
+            g_gesture.start_x = x;
+            g_gesture.start_y = y;
+            g_gesture.press_tick = now;
+            g_gesture.release_tick = 0;
+            g_gesture.state = TOUCH_STATE_PRESSING;
+        }
+        break;
+
+    case TOUCH_STATE_PRESSING:
+        if (!pen_down) {
+            /* 最短按压时间内松开: 误触/抖动, 忽略 (不产生事件) */
+            g_gesture.state = TOUCH_STATE_IDLE;
+        } else if (now - g_gesture.press_tick >= TOUCH_MIN_PRESS_TIME) {
+            /* 确认为有效按压 */
+            g_gesture.state = TOUCH_STATE_PRESSED;
+        }
+        break;
+
+    case TOUCH_STATE_PRESSED:
+        if (!pen_down) {
+            /* 释放消抖: 保持松开超过 TOUCH_RELEASE_DEBOUNCE 才确认释放 */
+            if (g_gesture.release_tick == 0) g_gesture.release_tick = now;
+            if (now - g_gesture.release_tick >= TOUCH_RELEASE_DEBOUNCE) {
+                g_gesture.release_tick = 0;
+                g_gesture.state = TOUCH_STATE_IDLE;
+                ev = TOUCH_EVENT_SINGLE_CLICK;   /* 单击: 松开确认后立即上报 */
+            }
+        } else {
+            g_gesture.release_tick = 0;   /* PEN 弹跳回到按下, 取消候选释放 */
+            if (coord_ok) {
+                /* 移动优先于长按 */
+                dx = (int)x - (int)g_gesture.start_x;
+                dy = (int)y - (int)g_gesture.start_y;
+                if (dx * dx + dy * dy >= TOUCH_SWIPE_THRESHOLD * TOUCH_SWIPE_THRESHOLD) {
+                    g_gesture.state = TOUCH_STATE_SWIPE;
+                    ev = TOUCH_EVENT_SWIPE;
+                } else if (now - g_gesture.press_tick >= TOUCH_LONG_PRESS_TIME) {
+                    g_gesture.state = TOUCH_STATE_LONG_PRESS;
+                    ev = TOUCH_EVENT_LONG_PRESS;
+                }
+            }
+        }
+        break;
+
+    case TOUCH_STATE_LONG_PRESS:
+    case TOUCH_STATE_SWIPE:
+        /* 终态: 松开后回到 IDLE, 不产生单击 */
+        if (!pen_down) {
+            g_gesture.state = TOUCH_STATE_IDLE;
+        }
+        break;
+
+    default:
+        g_gesture.state = TOUCH_STATE_IDLE;
+        break;
+    }
+
+    return ev;
 }
 
