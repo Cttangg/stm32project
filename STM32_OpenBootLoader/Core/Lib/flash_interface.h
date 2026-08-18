@@ -145,7 +145,7 @@ ErrorStatus OPENBL_FLASH_MassErase(uint8_t *p_Data, uint32_t DataLength);
   * @param  DataLength 扇区列表缓冲区的总字节数。
   * @retval SUCCESS 全部擦除成功; ERROR 存在擦除失败的扇区。
   * @note   使用示例 (擦除扇区 2 和 3):
-  *           uint8_t list[6] = {2U, 0U, 3U, 0U, 0U, 0U}; /* 个数=2, 扇区2, 扇区3 */
+  *           uint8_t list[6] = {2U, 0U, 3U, 0U, 0U, 0U};  (前 2 字节 = 个数, 后为扇区号)
   *           OPENBL_FLASH_Erase(list, sizeof(list));
   *         引导区扇区 (0..1) 会自动跳过; 扇区号越界 (>= 12) 时直接忽略。
   */
@@ -159,7 +159,7 @@ ErrorStatus OPENBL_FLASH_Erase(uint8_t *p_Data, uint32_t DataLength);
   * @param  Length      列表的字节数。
   * @retval SUCCESS 设置成功; ERROR State 参数非法。
   * @note   使用示例:
-  *           uint8_t sectors[2] = {2U, 0U};  /* 保护扇区 2 */
+  *           uint8_t sectors[2] = {2U, 0U};  (保护扇区 2)
   *           OPENBL_FLASH_SetWriteProtection(ENABLE, sectors, sizeof(sectors));
   *         修改后需系统复位生效 (函数内部已注册复位回调)。
   */
