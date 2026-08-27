@@ -1,17 +1,31 @@
 /**
  ******************************************************************************
  * @file    uart.h
- * @brief   STM32 通用串口库 — 基于 HAL_UART + DMA 环形接收
+ * @brief   STM32 通用串口库 — 基于 HAL_UART + DMA 环形接收 (句柄化, 多实例)
  *
  * 设计目标:
  *   - Linux tty 式抽象: 应用只调 UART_Init/Open/Send/Read/Task/RegisterFrame
  *   - 非阻塞收发: TX 环形缓冲 + DMA 链式; RX DMA CIRCULAR + IDLE → 软件环形
  *   - 帧协议可插拔: get_length / check / callback, 多协议链表共存
- *   - 多串口: 端口表预留 UART1~UART6, 当前注册 USART1
- *   - 零 malloc / ISR 安全 / 裸机 RTOS 双栖 / 统一错误码 + 统计
+ *   - 句柄化: 每个串口一个 UART_Device, 绑定各自的 HAL huart, 互不干扰
+ *   - 零 malloc: 缓冲内嵌于 UART_Device (应用层 static 定义)
+ *   - ISR 安全 / 裸机 RTOS 双栖 / 统一错误码 + 统计
  *
  * 硬件: STM32F407VETx, 底层 DMA 由 CubeMX 配置 (RX CIRCULAR), TX 在 Open 时
  *       由库重配为 NORMAL (一次性发送).
+ *
+ * 使用示例:
+ *   static UART_Device dbg, cam;
+ *
+ *   UART_Init(&dbg, &huart1);   // USART1 调试口
+ *   UART_Init(&cam, &huart2);   // USART2 摄像头
+ *   UART_Open(&dbg);
+ *   UART_Open(&cam);
+ *   ...
+ *   while (1) {
+ *       UART_Task(&dbg);
+ *       UART_Task(&cam);
+ *   }
  ******************************************************************************
  */
 #ifndef __UART_H
@@ -25,20 +39,7 @@ extern "C" {
 #endif
 
 /* ========================================================================= */
-/*  一、端口枚举 (预留多串口, 命名带 P 前缀避开 CMSIS 外设宏 UART4/UART5)       */
-/* ========================================================================= */
-typedef enum {
-    UART_P1 = 0,   /* USART1  PA9(TX) PA10(RX)  APB2 AF7  DMA2-S7(TX) DMA2-S2(RX) */
-    UART_P2 = 1,   /* USART2  PA2(TX) PA3(RX)   APB1 AF7  DMA1-S6(TX) DMA1-S5(RX) */
-    UART_P3 = 2,   /* USART3  PB10(TX) PB11(RX) APB1 AF7                         */
-    UART_P4 = 3,   /* UART4                                                      */
-    UART_P5 = 4,   /* UART5                                                      */
-    UART_P6 = 5,   /* USART6  PC6(TX) PC7(RX)   APB2 AF8                         */
-    UART_PMAX
-} UART_Port;
-
-/* ========================================================================= */
-/*  二、错误码                                                                */
+/*  一、错误码                                                                */
 /* ========================================================================= */
 typedef enum {
     UART_OK       =  0,
@@ -49,15 +50,18 @@ typedef enum {
 } UART_Status;
 
 /* ========================================================================= */
-/*  三、帧协议                                                                */
+/*  二、帧协议                                                                */
 /* ========================================================================= */
+
+/* 前置声明 (UART_Device 在下方定义, 回调签名需要它) */
+struct UART_Device;
 
 /** 帧长度提取回调: 输入已收数据, 返回帧总长度 (0=错误) */
 typedef uint16_t (*UART_FrameGetLength)(const uint8_t *buf);
 /** 帧校验回调: 返回 1=通过 0=失败 */
 typedef uint8_t  (*UART_FrameCheck)(const uint8_t *buf, uint16_t len);
 /** 帧完成回调 (在 UART_Task 上下文中执行) */
-typedef void     (*UART_FrameCallback)(UART_Port port, uint8_t *data, uint16_t len);
+typedef void     (*UART_FrameCallback)(struct UART_Device *dev, uint8_t *data, uint16_t len);
 
 /**
  * 帧格式描述符 (链表节点). 用户只需配置:
@@ -88,6 +92,17 @@ typedef struct UART_Frame {
 } UART_Frame;
 
 /* ========================================================================= */
+/*  三、软件环形缓冲 (单生产者-单消费者, ISR 安全)                             */
+/* ========================================================================= */
+typedef struct {
+    uint8_t           *buf;
+    uint16_t           size;    /* 2^n */
+    volatile uint16_t  write;
+    volatile uint16_t  read;
+    volatile uint32_t  overflow;
+} UART_RingBuf;
+
+/* ========================================================================= */
 /*  四、统计                                                                  */
 /* ========================================================================= */
 typedef struct {
@@ -100,39 +115,68 @@ typedef struct {
 } UART_Stats;
 
 /* ========================================================================= */
-/*  五、公开 API                                                              */
+/*  五、串口句柄                                                              */
+/* ========================================================================= */
+typedef struct UART_Device {
+    UART_HandleTypeDef *huart;     /* 绑定的 HAL UART 句柄 (NULL=未绑定) */
+    uint8_t             opened;
+
+    /* RX */
+    uint8_t             rx_dma_buf[256];
+    volatile uint16_t   rx_last_pos;
+    UART_RingBuf        rx_rb;
+    uint8_t             rx_rb_buf[1024];
+
+    /* TX */
+    UART_RingBuf        tx_rb;
+    uint8_t             tx_rb_buf[512];
+    uint8_t             tx_temp[128];
+    volatile uint8_t    tx_busy;
+
+    /* Frame */
+    uint8_t             frame_buf[256];
+    uint16_t            frame_idx;
+    UART_Frame         *frame_list;
+    UART_Frame          frame_pool[4];
+    uint8_t             frame_used;
+
+    UART_Stats          stats;
+} UART_Device;
+
+/* ========================================================================= */
+/*  六、公开 API (全部接收句柄指针, 多串口独立控制)                            */
 /* ========================================================================= */
 
-/** @brief 初始化端口表 (HAL_Init + 外设 Init 之后调用一次) */
-void UART_Init(void);
+/** @brief 绑定 HAL huart 并初始化句柄 (外设 Init 之后调用; 每设备调用一次) */
+void UART_Init(UART_Device *dev, UART_HandleTypeDef *huart);
 
-/** @brief 打开串口 (使用 CubeMX 已初始化的 huart 句柄) */
-UART_Status UART_Open(UART_Port port);
+/** @brief 打开串口, 启动 DMA RX (IDLE 接收) */
+UART_Status UART_Open(UART_Device *dev);
 
 /** @brief 关闭串口, 停止 DMA */
-UART_Status UART_Close(UART_Port port);
+UART_Status UART_Close(UART_Device *dev);
 
 /** @brief 非阻塞发送, 实际入队字节数写入 *written */
-UART_Status UART_Send(UART_Port port, const uint8_t *data, uint16_t len,
+UART_Status UART_Send(UART_Device *dev, const uint8_t *data, uint16_t len,
                       uint16_t *written);
 
 /** @brief 是否正在发送 (1=忙 0=空闲) */
-uint8_t UART_IsSending(UART_Port port);
+uint8_t UART_IsSending(const UART_Device *dev);
 
 /** @brief 查询 RX 环形缓冲可读字节数 */
-uint16_t UART_Available(UART_Port port);
+uint16_t UART_Available(const UART_Device *dev);
 
 /** @brief 读取原始字节 */
-uint16_t UART_Read(UART_Port port, uint8_t *buf, uint16_t max_len);
+uint16_t UART_Read(UART_Device *dev, uint8_t *buf, uint16_t max_len);
 
-/** @brief 注册帧协议和回调 */
-UART_Status UART_RegisterFrame(UART_Port port, UART_Frame *frame);
+/** @brief 注册帧协议和回调 (链表, 最多 4 个) */
+UART_Status UART_RegisterFrame(UART_Device *dev, UART_Frame *frame);
 
 /** @brief 主循环周期调用: 环形→帧解析→回调 + 帧超时处理 */
-void UART_Task(void);
+void UART_Task(UART_Device *dev);
 
 /** @brief 调试统计 */
-const UART_Stats *UART_GetStats(UART_Port port);
+const UART_Stats *UART_GetStats(const UART_Device *dev);
 
 #ifdef __cplusplus
 }

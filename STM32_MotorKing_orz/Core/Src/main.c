@@ -74,6 +74,9 @@ static TMC2209_HandleTypeDef motor_pan;
 static MotorStepper stepper_pan;
 static MotorPID pid_pan;
 
+/* 串口库设备: USART1 调试口, USART2 摄像头 */
+static UART_Device uart_dbg, uart_cam;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -178,9 +181,10 @@ int main(void)
   MotorPID_Init(&pid_pan);
 
   /* 串口库: USART1 调试口 + USART2 摄像头 (RX DMA 需为 Circular) */
-  UART_Init();
-  UART_Open(UART_P1);
-  UART_Open(UART_P2);
+  UART_Init(&uart_dbg, &huart1);
+  UART_Init(&uart_cam, &huart2);
+  UART_Open(&uart_dbg);
+  UART_Open(&uart_cam);
 
   /* USER CODE END 2 */
 
@@ -189,7 +193,8 @@ int main(void)
   while (1)
   {
     /* 串口帧解析/回调 (必须周期调用) */
-    UART_Task();
+    UART_Task(&uart_dbg);
+    UART_Task(&uart_cam);
 
     /* 位置闭环 5ms 周期 (占位, 待应用逻辑):
        MotorPID_Update(&pid_tilt, MT6701_ReadDegrees(&enc_tilt), 0.005f);

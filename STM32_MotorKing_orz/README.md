@@ -70,7 +70,7 @@ USART1 ──► 调试口
 
 | 驱动 | 说明 | 状态 |
 |------|------|------|
-| `uart.c/h` | DMA 串口库（UART_P1 调试口 + UART_P2 摄像头） | 已移植 |
+| `uart.c/h` | DMA 串口库（句柄化：`UART_Device`，uart_dbg=USART1 / uart_cam=USART2） | 已移植 |
 | `mt6701.c/h` | 磁编码器（句柄化改造，支持 I2C1/I2C2 双实例） | 已移植 |
 | `tmc2209.c/h` | TMC2209 驱动板（原生句柄化） | 已移植 |
 | `motor_stepper.c/h` | STEP 脉冲引擎（句柄化改造，TIM13/TIM14 双实例） | 已移植 |
