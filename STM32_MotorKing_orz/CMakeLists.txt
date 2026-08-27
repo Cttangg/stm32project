@@ -45,11 +45,17 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
+    Core/Lib/mt6701.c
+    Core/Lib/uart.c
+    Core/Lib/tmc2209.c
+    Core/Lib/motor_pid.c
+    Core/Lib/motor_stepper.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    Core/Lib
 )
 
 # Add project symbols (macros)

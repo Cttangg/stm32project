@@ -59,12 +59,27 @@ USART1 ──► 调试口
 
 | 外设 | 用途 | 状态 |
 |------|------|------|
-| TIM14 | 电机1 STEP 脉冲 | 待注册 |
-| TIM13 | 电机2 STEP 脉冲 | 待注册 |
+| TIM14 | 电机1 (Tilt) STEP 脉冲 | 已注册 |
+| TIM13 | 电机2 (Pan) STEP 脉冲 | 已注册 |
 | I2C1 / I2C2 | MT6701 ×2 | 已配置 |
 | USART1 + DMA | 调试口 | 已配置 |
 | USART2 + DMA | 摄像头 | 已配置（RX 模式待改） |
 | SPI1 | 预留 | 已配置 |
+
+## 驱动移植（Core/Lib，源自 DriverLib_King_orz）
+
+| 驱动 | 说明 | 状态 |
+|------|------|------|
+| `uart.c/h` | DMA 串口库（UART_P1 调试口 + UART_P2 摄像头） | 已移植 |
+| `mt6701.c/h` | 磁编码器（句柄化改造，支持 I2C1/I2C2 双实例） | 已移植 |
+| `tmc2209.c/h` | TMC2209 驱动板（原生句柄化） | 已移植 |
+| `motor_stepper.c/h` | STEP 脉冲引擎（句柄化改造，TIM13/TIM14 双实例） | 已移植 |
+| `motor_pid.c/h` | 位置闭环 PID（原生句柄化） | 已移植 |
+
+> 注意事项：
+> - 两个电机在 `main.c` USER CODE 区实例化：`tilt`（TIM14+I2C1）、`pan`（TIM13+I2C2）
+> - TIM 中断分发（`TIM8_TRG_COM_TIM14_IRQHandler`/`TIM8_UP_TIM13_IRQHandler`）在 main.c USER CODE BEGIN 0 区
+> - CubeMX 重新生成前请确认 `.ioc` 中 TIM13/TIM14 已注册（已注册），生成后 `stm32f4xx_hal_conf.h` 会自动启用 HAL_TIM
 
 ## 构建
 
@@ -81,3 +96,4 @@ cmake --build --preset Debug
 - [ ] 电机2 引脚变更
 - [ ] USART2 RX DMA 改 Circular
 - [ ] 位置闭环标定（细分按 TMC2209 驱动板说明）
+- [ ] 应用逻辑：状态机（复位/沿框移动/视觉追踪）

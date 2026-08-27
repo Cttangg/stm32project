@@ -21,7 +21,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "usart.h"
+#include "mt6701.h"
+#include "tmc2209.h"
+#include "motor_pid.h"
+#include "motor_stepper.h"
+#include "uart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,6 +50,9 @@ I2C_HandleTypeDef hi2c2;
 
 SPI_HandleTypeDef hspi1;
 
+TIM_HandleTypeDef htim13;
+TIM_HandleTypeDef htim14;
+
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart1_rx;
@@ -53,6 +61,18 @@ DMA_HandleTypeDef hdma_usart2_rx;
 DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
+
+/* 电机1 = Tilt (竖直轴, TIM14 + I2C1 + EN_1/DIR_1/STEP_1/MS1_1/MS2_1) */
+static MT6701_HandleTypeDef enc_tilt;
+static TMC2209_HandleTypeDef motor_tilt;
+static MotorStepper stepper_tilt;
+static MotorPID pid_tilt;
+
+/* 电机2 = Pan (水平轴, TIM13 + I2C2 + EN_2/DIR_2/STEP_2/MS1_2/MS2_2) */
+static MT6701_HandleTypeDef enc_pan;
+static TMC2209_HandleTypeDef motor_pan;
+static MotorStepper stepper_pan;
+static MotorPID pid_pan;
 
 /* USER CODE END PV */
 
@@ -65,12 +85,24 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_TIM13_Init(void);
+static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* STEP 定时器中断分发: TIM14 → Tilt, TIM13 → Pan
+   (与 TIM8 TRG/COM / UP 共用向量, 强定义覆盖 startup 弱引用) */
+void TIM8_TRG_COM_TIM14_IRQHandler(void) {
+    MotorStepper_IRQHandler(&stepper_tilt);
+}
+
+void TIM8_UP_TIM13_IRQHandler(void) {
+    MotorStepper_IRQHandler(&stepper_pan);
+}
 
 /* USER CODE END 0 */
 
@@ -109,7 +141,46 @@ int main(void)
   MX_USART2_UART_Init();
   MX_I2C2_Init();
   MX_SPI1_Init();
+  MX_TIM13_Init();
+  MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
+
+  /* MT6701 编码器 (I2C1/I2C2, 400kHz) */
+  if (MT6701_Init(&enc_tilt, &hi2c1) != 0) {
+    /* 电机1 编码器未应答 */
+  }
+  if (MT6701_Init(&enc_pan, &hi2c2) != 0) {
+    /* 电机2 编码器未应答 */
+  }
+
+  /* TMC2209 驱动板 (GPIO 由 MX_GPIO_Init 配置) */
+  TMC2209_Init(&motor_tilt, &(TMC2209_PinConfig){
+      .en   = {EN_1_GPIO_Port,   EN_1_Pin},
+      .step = {STEP_1_GPIO_Port, STEP_1_Pin},
+      .dir  = {DIR_1_GPIO_Port,  DIR_1_Pin},
+      .ms1  = {MS1_1_GPIO_Port,  MS1_1_Pin},
+      .ms2  = {MS2_1_GPIO_Port,  MS2_1_Pin},
+  });
+  TMC2209_Init(&motor_pan, &(TMC2209_PinConfig){
+      .en   = {EN_2_GPIO_Port,   EN_2_Pin},
+      .step = {STEP_2_GPIO_Port, STEP_2_Pin},
+      .dir  = {DIR_2_GPIO_Port,  DIR_2_Pin},
+      .ms1  = {MS1_2_GPIO_Port,  MS1_2_Pin},
+      .ms2  = {MS2_2_GPIO_Port,  MS2_2_Pin},
+  });
+
+  /* STEP 脉冲引擎: Tilt→TIM14, Pan→TIM13 */
+  MotorStepper_Init(&stepper_tilt, &motor_tilt, &htim14);
+  MotorStepper_Init(&stepper_pan,  &motor_pan,  &htim13);
+
+  /* 位置闭环 PID (默认 1/32 细分标定) */
+  MotorPID_Init(&pid_tilt);
+  MotorPID_Init(&pid_pan);
+
+  /* 串口库: USART1 调试口 + USART2 摄像头 (RX DMA 需为 Circular) */
+  UART_Init();
+  UART_Open(UART_P1);
+  UART_Open(UART_P2);
 
   /* USER CODE END 2 */
 
@@ -117,6 +188,15 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* 串口帧解析/回调 (必须周期调用) */
+    UART_Task();
+
+    /* 位置闭环 5ms 周期 (占位, 待应用逻辑):
+       MotorPID_Update(&pid_tilt, MT6701_ReadDegrees(&enc_tilt), 0.005f);
+       MotorPID_Update(&pid_pan,  MT6701_ReadDegrees(&enc_pan),  0.005f);
+       MotorStepper_SetVelocity(&stepper_tilt, pid_tilt.vel_ref);
+       MotorStepper_SetVelocity(&stepper_pan,  pid_pan.vel_ref); */
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -272,6 +352,68 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM13 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM13_Init(void)
+{
+
+  /* USER CODE BEGIN TIM13_Init 0 */
+
+  /* USER CODE END TIM13_Init 0 */
+
+  /* USER CODE BEGIN TIM13_Init 1 */
+
+  /* USER CODE END TIM13_Init 1 */
+  htim13.Instance = TIM13;
+  htim13.Init.Prescaler = 167;
+  htim13.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim13.Init.Period = 65535;
+  htim13.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim13.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim13) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM13_Init 2 */
+
+  /* USER CODE END TIM13_Init 2 */
+
+}
+
+/**
+  * @brief TIM14 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM14_Init(void)
+{
+
+  /* USER CODE BEGIN TIM14_Init 0 */
+
+  /* USER CODE END TIM14_Init 0 */
+
+  /* USER CODE BEGIN TIM14_Init 1 */
+
+  /* USER CODE END TIM14_Init 1 */
+  htim14.Instance = TIM14;
+  htim14.Init.Prescaler = 167;
+  htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim14.Init.Period = 65535;
+  htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM14_Init 2 */
+
+  /* USER CODE END TIM14_Init 2 */
 
 }
 
