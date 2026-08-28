@@ -65,13 +65,13 @@ DMA_HandleTypeDef hdma_usart2_tx;
 /* 电机1 = Tilt (竖直轴, TIM14 + I2C1 + EN_1/DIR_1/STEP_1/MS1_1/MS2_1) */
 static MT6701_HandleTypeDef enc_tilt;
 static TMC2209_HandleTypeDef motor_tilt;
-static MotorStepper stepper_tilt;
+MotorStepper stepper_tilt;      /* 全局: stm32f4xx_it.c 中断分发需要 */
 static MotorPID pid_tilt;
 
 /* 电机2 = Pan (水平轴, TIM13 + I2C2 + EN_2/DIR_2/STEP_2/MS1_2/MS2_2) */
 static MT6701_HandleTypeDef enc_pan;
 static TMC2209_HandleTypeDef motor_pan;
-static MotorStepper stepper_pan;
+MotorStepper stepper_pan;       /* 全局: stm32f4xx_it.c 中断分发需要 */
 static MotorPID pid_pan;
 
 /* 串口库设备: USART1 调试口, USART2 摄像头 */
@@ -97,15 +97,8 @@ static void MX_TIM14_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* STEP 定时器中断分发: TIM14 → Tilt, TIM13 → Pan
-   (与 TIM8 TRG/COM / UP 共用向量, 强定义覆盖 startup 弱引用) */
-void TIM8_TRG_COM_TIM14_IRQHandler(void) {
-    MotorStepper_IRQHandler(&stepper_tilt);
-}
-
-void TIM8_UP_TIM13_IRQHandler(void) {
-    MotorStepper_IRQHandler(&stepper_pan);
-}
+/* TIM 中断处理由 stm32f4xx_it.c 生成区接管 (CubeMX 已勾选 NVIC):
+   TIM14 → stepper_tilt, TIM13 → stepper_pan, 分发见 stm32f4xx_it.c USER CODE 区 */
 
 /* USER CODE END 0 */
 
@@ -372,16 +365,30 @@ static void MX_TIM13_Init(void)
 
   /* USER CODE END TIM13_Init 0 */
 
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
   /* USER CODE BEGIN TIM13_Init 1 */
 
   /* USER CODE END TIM13_Init 1 */
   htim13.Instance = TIM13;
-  htim13.Init.Prescaler = 167;
+  htim13.Init.Prescaler = 0;
   htim13.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim13.Init.Period = 65535;
   htim13.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim13.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim13) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OC_Init(&htim13) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_OC_ConfigChannel(&htim13, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -403,16 +410,30 @@ static void MX_TIM14_Init(void)
 
   /* USER CODE END TIM14_Init 0 */
 
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
   /* USER CODE BEGIN TIM14_Init 1 */
 
   /* USER CODE END TIM14_Init 1 */
   htim14.Instance = TIM14;
-  htim14.Init.Prescaler = 167;
+  htim14.Init.Prescaler = 0;
   htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim14.Init.Period = 65535;
   htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OC_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_OC_ConfigChannel(&htim14, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -529,42 +550,65 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(EN_2_GPIO_Port, EN_2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, LCD_DC_Pin|LCD_RES_Pin|DIR_1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, EN_1_Pin|MS1_2_Pin|MS1_1_Pin|MS2_2_Pin
-                          |MS2_1_Pin|STEP_2_Pin|STEP_1_Pin|DIR_2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, LCD_BL_Pin|LCD_CS_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(DIR_1_GPIO_Port, DIR_1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOE, DIR_2_Pin|STEP_2_Pin|MS2_2_Pin|MS1_2_Pin
+                          |EN_2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : EN_2_Pin */
-  GPIO_InitStruct.Pin = EN_2_Pin;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, EN_1_Pin|MS1_1_Pin|MS2_1_Pin|STEP_1_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : LCD_DC_Pin LCD_RES_Pin DIR_1_Pin */
+  GPIO_InitStruct.Pin = LCD_DC_Pin|LCD_RES_Pin|DIR_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(EN_2_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : EN_1_Pin MS1_2_Pin MS1_1_Pin MS2_2_Pin
-                           MS2_1_Pin STEP_2_Pin STEP_1_Pin DIR_2_Pin */
-  GPIO_InitStruct.Pin = EN_1_Pin|MS1_2_Pin|MS1_1_Pin|MS2_2_Pin
-                          |MS2_1_Pin|STEP_2_Pin|STEP_1_Pin|DIR_2_Pin;
+  /*Configure GPIO pins : LCD_BL_Pin LCD_CS_Pin */
+  GPIO_InitStruct.Pin = LCD_BL_Pin|LCD_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : DIR_2_Pin STEP_2_Pin MS2_2_Pin MS1_2_Pin
+                           EN_2_Pin */
+  GPIO_InitStruct.Pin = DIR_2_Pin|STEP_2_Pin|MS2_2_Pin|MS1_2_Pin
+                          |EN_2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : EN_1_Pin MS1_1_Pin MS2_1_Pin STEP_1_Pin */
+  GPIO_InitStruct.Pin = EN_1_Pin|MS1_1_Pin|MS2_1_Pin|STEP_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : DIR_1_Pin */
-  GPIO_InitStruct.Pin = DIR_1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  /*Configure GPIO pins : KEY_PAUSE_Pin KEY_RESET_Pin KEY_TRACK_Pin KEY_BORDER_Pin */
+  GPIO_InitStruct.Pin = KEY_PAUSE_Pin|KEY_RESET_Pin|KEY_TRACK_Pin|KEY_BORDER_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(DIR_1_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : KEY_CALIB_Pin KEY_A4_Pin */
+  GPIO_InitStruct.Pin = KEY_CALIB_Pin|KEY_A4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

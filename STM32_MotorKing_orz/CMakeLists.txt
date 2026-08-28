@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Lib/tmc2209.c
     Core/Lib/motor_pid.c
     Core/Lib/motor_stepper.c
+    Core/Lib/st7735.c
 )
 
 # Add include paths

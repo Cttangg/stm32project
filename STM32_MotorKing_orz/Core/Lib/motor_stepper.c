@@ -69,15 +69,8 @@ void MotorStepper_Init(MotorStepper *s, TMC2209_HandleTypeDef *motor, TIM_Handle
     /* STEP 引脚初始低 (idle) */
     step_pin_reset(s);
 
-    /* 使能 TIM 更新中断 + NVIC (优先级低于 DMA0/UART1, 避免干扰收发) */
+    /* 使能 TIM 更新中断 (NVIC 优先级/使能由 CubeMX MspInit 统一管理) */
     __HAL_TIM_ENABLE_IT(htim, TIM_IT_UPDATE);
-    if (htim->Instance == TIM13) {
-        HAL_NVIC_SetPriority(TIM8_UP_TIM13_IRQn, 3, 0);
-        HAL_NVIC_EnableIRQ(TIM8_UP_TIM13_IRQn);
-    } else if (htim->Instance == TIM14) {
-        HAL_NVIC_SetPriority(TIM8_TRG_COM_TIM14_IRQn, 3, 0);
-        HAL_NVIC_EnableIRQ(TIM8_TRG_COM_TIM14_IRQn);
-    }
 
     MotorStepper_Stop(s);
 }

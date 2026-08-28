@@ -15,9 +15,10 @@
 ```
 摄像头(待约定) ──USART2──► STM32F407 ──TIM13/14 STEP──► TMC2209×2 ──► 42步进电机×2 ──► 云台(pan/tilt)
                               │                                        ▲
+                              ├── SPI1 ◄── ST7735 LCD (显示/交互)
                               └── I2C1/I2C2 ◄──── MT6701 编码器×2 ──────┘
 USART1 ──► 调试口
-按键×6 (待注册)
+按键×6 ──► 输入
 ```
 
 ## 引脚分配
@@ -37,14 +38,34 @@ USART1 ──► 调试口
 
 | 信号 | 引脚 | 说明 |
 |------|------|------|
-| EN_2 | PB15 | TMC2209 使能（低有效） |
-| DIR_2 | PD15 | 方向 |
-| STEP_2 | PD13 | 步进脉冲（TIM13 ISR 翻转） |
-| MS1_2 | PD9 | 细分 |
-| MS2_2 | PD11 | 细分 |
+| EN_2 | PE15 | TMC2209 使能（低有效） |
+| DIR_2 | PE7 | 方向 |
+| STEP_2 | PE9 | 步进脉冲（TIM13 ISR 翻转） |
+| MS1_2 | PE13 | 细分 |
+| MS2_2 | PE11 | 细分 |
 | MT6701_2 | I2C2 (PB10/PB11) | 编码器 400kHz |
 
-> 电机 2 引脚定义待变更，变更后同步更新本表与 `.ioc`。
+### 按键（GPIO 输入, NOPULL）
+
+| 信号 | 引脚 | 说明 |
+|------|------|------|
+| KEY_PAUSE | PB3 | 暂停/继续 |
+| KEY_RESET | PB5 | 复位回原点 |
+| KEY_TRACK | PB8 | 一键追踪 |
+| KEY_BORDER | PB9 | 沿屏幕边线移动 |
+| KEY_CALIB | PE0 | 标定 |
+| KEY_A4 | PE1 | A4 靶纸 |
+
+### LCD（ST7735, SPI1 + GPIO 控制线）
+
+| 信号 | 引脚 | 说明 |
+|------|------|------|
+| SCK | PA5 | SPI1_SCK |
+| MOSI | PA7 | SPI1_MOSI |
+| LCD_CS | PB1 | 片选（低有效） |
+| LCD_DC | PC4 | 数据/命令 |
+| LCD_RES | PC5 | 复位（低有效） |
+| LCD_BL | PB0 | 背光（高有效） |
 
 ### 串口
 
@@ -59,12 +80,12 @@ USART1 ──► 调试口
 
 | 外设 | 用途 | 状态 |
 |------|------|------|
-| TIM14 | 电机1 (Tilt) STEP 脉冲 | 已注册 |
-| TIM13 | 电机2 (Pan) STEP 脉冲 | 已注册 |
+| TIM14 | 电机1 (Tilt) STEP 脉冲 | 已注册（NVIC 已勾选，OC1 No Output） |
+| TIM13 | 电机2 (Pan) STEP 脉冲 | 已注册（NVIC 已勾选，OC1 No Output） |
 | I2C1 / I2C2 | MT6701 ×2 | 已配置 |
 | USART1 + DMA | 调试口 | 已配置 |
 | USART2 + DMA | 摄像头 | 已配置（RX 模式待改） |
-| SPI1 | 预留 | 已配置 |
+| SPI1 | ST7735 LCD | 已配置 |
 
 ## 驱动移植（Core/Lib，源自 DriverLib_King_orz）
 
@@ -75,6 +96,7 @@ USART1 ──► 调试口
 | `tmc2209.c/h` | TMC2209 驱动板（原生句柄化） | 已移植 |
 | `motor_stepper.c/h` | STEP 脉冲引擎（句柄化改造，TIM13/TIM14 双实例） | 已移植 |
 | `motor_pid.c/h` | 位置闭环 PID（原生句柄化） | 已移植 |
+| `st7735.c/h` | ST7735 SPI 屏驱动（预留骨架，待实现） | 已建 |
 
 > 注意事项：
 > - 两个电机在 `main.c` USER CODE 区实例化：`tilt`（TIM14+I2C1）、`pan`（TIM13+I2C2）
@@ -92,8 +114,9 @@ cmake --build --preset Debug
 ## 待办
 
 - [ ] 摄像头帧协议约定（USART2）
-- [ ] 6 个按键注册
-- [ ] 电机2 引脚变更
+- [x] 6 个按键注册（KEY_PAUSE/RESET/TRACK/BORDER/CALIB/A4）
+- [x] 电机2 引脚变更（已移至 PE7/PE9/PE11/PE13/PE15）
 - [ ] USART2 RX DMA 改 Circular
 - [ ] 位置闭环标定（细分按 TMC2209 驱动板说明）
 - [ ] 应用逻辑：状态机（复位/沿框移动/视觉追踪）
+- [ ] ST7735 LCD 驱动实现（骨架已建，Core/Lib/st7735.c/h）
