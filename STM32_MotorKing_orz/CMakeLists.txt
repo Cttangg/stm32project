@@ -50,6 +50,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Lib/tmc2209.c
     Core/Lib/motor_pid.c
     Core/Lib/motor_stepper.c
+    Core/Lib/motor_axis.c
+    Core/Lib/motion.c
+    Core/Lib/motion_arbiter.c
+    Core/Lib/app.c
     Core/Lib/st7735.c
 )
 

@@ -21,12 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "usart.h"
-#include "mt6701.h"
-#include "tmc2209.h"
-#include "motor_pid.h"
-#include "motor_stepper.h"
-#include "uart.h"
+#include "app.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,20 +57,7 @@ DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
 
-/* 电机1 = Tilt (竖直轴, TIM14 + I2C1 + EN_1/DIR_1/STEP_1/MS1_1/MS2_1) */
-static MT6701_HandleTypeDef enc_tilt;
-static TMC2209_HandleTypeDef motor_tilt;
-MotorStepper stepper_tilt;      /* 全局: stm32f4xx_it.c 中断分发需要 */
-static MotorPID pid_tilt;
-
-/* 电机2 = Pan (水平轴, TIM13 + I2C2 + EN_2/DIR_2/STEP_2/MS1_2/MS2_2) */
-static MT6701_HandleTypeDef enc_pan;
-static TMC2209_HandleTypeDef motor_pan;
-MotorStepper stepper_pan;       /* 全局: stm32f4xx_it.c 中断分发需要 */
-static MotorPID pid_pan;
-
-/* 串口库设备: USART1 调试口, USART2 摄像头 */
-static UART_Device uart_dbg, uart_cam;
+/* 驱动实例、运动/仲裁库、标定状态全部封装在 app.c (L4 应用层) */
 
 /* USER CODE END PV */
 
@@ -141,43 +123,8 @@ int main(void)
   MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
 
-  /* MT6701 编码器 (I2C1/I2C2, 400kHz) */
-  if (MT6701_Init(&enc_tilt, &hi2c1) != 0) {
-    /* 电机1 编码器未应答 */
-  }
-  if (MT6701_Init(&enc_pan, &hi2c2) != 0) {
-    /* 电机2 编码器未应答 */
-  }
-
-  /* TMC2209 驱动板 (GPIO 由 MX_GPIO_Init 配置) */
-  TMC2209_Init(&motor_tilt, &(TMC2209_PinConfig){
-      .en   = {EN_1_GPIO_Port,   EN_1_Pin},
-      .step = {STEP_1_GPIO_Port, STEP_1_Pin},
-      .dir  = {DIR_1_GPIO_Port,  DIR_1_Pin},
-      .ms1  = {MS1_1_GPIO_Port,  MS1_1_Pin},
-      .ms2  = {MS2_1_GPIO_Port,  MS2_1_Pin},
-  });
-  TMC2209_Init(&motor_pan, &(TMC2209_PinConfig){
-      .en   = {EN_2_GPIO_Port,   EN_2_Pin},
-      .step = {STEP_2_GPIO_Port, STEP_2_Pin},
-      .dir  = {DIR_2_GPIO_Port,  DIR_2_Pin},
-      .ms1  = {MS1_2_GPIO_Port,  MS1_2_Pin},
-      .ms2  = {MS2_2_GPIO_Port,  MS2_2_Pin},
-  });
-
-  /* STEP 脉冲引擎: Tilt→TIM14, Pan→TIM13 */
-  MotorStepper_Init(&stepper_tilt, &motor_tilt, &htim14);
-  MotorStepper_Init(&stepper_pan,  &motor_pan,  &htim13);
-
-  /* 位置闭环 PID (默认 1/32 细分标定) */
-  MotorPID_Init(&pid_tilt);
-  MotorPID_Init(&pid_pan);
-
-  /* 串口库: USART1 调试口 + USART2 摄像头 (RX DMA 需为 Circular) */
-  UART_Init(&uart_dbg, &huart1);
-  UART_Init(&uart_cam, &huart2);
-  UART_Open(&uart_dbg);
-  UART_Open(&uart_cam);
+  /* 应用层: 驱动实例 + 运动/仲裁库 + 按键 + 串口 (L4) */
+  APP_Init();
 
   /* USER CODE END 2 */
 
@@ -185,15 +132,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* 串口帧解析/回调 (必须周期调用) */
-    UART_Task(&uart_dbg);
-    UART_Task(&uart_cam);
-
-    /* 位置闭环 5ms 周期 (占位, 待应用逻辑):
-       MotorPID_Update(&pid_tilt, MT6701_ReadDegrees(&enc_tilt), 0.005f);
-       MotorPID_Update(&pid_pan,  MT6701_ReadDegrees(&enc_pan),  0.005f);
-       MotorStepper_SetVelocity(&stepper_tilt, pid_tilt.vel_ref);
-       MotorStepper_SetVelocity(&stepper_pan,  pid_pan.vel_ref); */
+    /* 按键扫描 + 状态机 + 串口打印/收发 (L4) */
+    APP_Task();
 
     /* USER CODE END WHILE */
 
@@ -566,7 +506,7 @@ static void MX_GPIO_Init(void)
                           |EN_2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, EN_1_Pin|MS1_1_Pin|MS2_1_Pin|STEP_1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, EN_1_Pin|MS1_1_Pin|MS2_1_BK_Pin|STEP_1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : LCD_DC_Pin LCD_RES_Pin DIR_1_Pin */
   GPIO_InitStruct.Pin = LCD_DC_Pin|LCD_RES_Pin|DIR_1_Pin;
@@ -591,23 +531,29 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : EN_1_Pin MS1_1_Pin MS2_1_Pin STEP_1_Pin */
-  GPIO_InitStruct.Pin = EN_1_Pin|MS1_1_Pin|MS2_1_Pin|STEP_1_Pin;
+  /*Configure GPIO pins : EN_1_Pin MS1_1_Pin MS2_1_BK_Pin STEP_1_Pin */
+  GPIO_InitStruct.Pin = EN_1_Pin|MS1_1_Pin|MS2_1_BK_Pin|STEP_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : MS2_1_Pin */
+  GPIO_InitStruct.Pin = MS2_1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(MS2_1_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pins : KEY_PAUSE_Pin KEY_RESET_Pin KEY_TRACK_Pin KEY_BORDER_Pin */
   GPIO_InitStruct.Pin = KEY_PAUSE_Pin|KEY_RESET_Pin|KEY_TRACK_Pin|KEY_BORDER_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : KEY_CALIB_Pin KEY_A4_Pin */
   GPIO_InitStruct.Pin = KEY_CALIB_Pin|KEY_A4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */

@@ -79,6 +79,8 @@ void Error_Handler(void);
 #define EN_1_GPIO_Port GPIOD
 #define MS1_1_Pin GPIO_PIN_10
 #define MS1_1_GPIO_Port GPIOD
+#define MS2_1_BK_Pin GPIO_PIN_11
+#define MS2_1_BK_GPIO_Port GPIOD
 #define MS2_1_Pin GPIO_PIN_12
 #define MS2_1_GPIO_Port GPIOD
 #define STEP_1_Pin GPIO_PIN_14

@@ -25,11 +25,14 @@ static void step_pin_reset(MotorStepper *s) {
     HAL_GPIO_WritePin(s->motor->pins.step.port, s->motor->pins.step.pin, GPIO_PIN_RESET);
 }
 
-/* 计算 PSC/ARR, 使更新率 = 2×rate; 停表重配后重启 */
+/* 计算 PSC/ARR, 使更新率 = 2×rate.
+ * 定时器运行中只改影子寄存器(PSC 自动缓冲, ARR 开 ARPE), 不重置计数器、
+ * 不产生多余更新事件 —— 否则运动层每周期更新速度时会把脉冲序列不断清零. */
 static void stepper_set_rate(MotorStepper *s, float rate) {
     TIM_HandleTypeDef *htim = s->htim;
     uint64_t d;
     uint32_t psc, arr;
+    uint8_t  running;
 
     if (rate <= 0.0f) { MotorStepper_Stop(s); return; }
     if (rate > 50000.0f) rate = 50000.0f;      /* 保护上限 */
@@ -42,15 +45,24 @@ static void stepper_set_rate(MotorStepper *s, float rate) {
     arr = (uint32_t)(d / (psc + 1)) - 1;
     if (arr > 65535) arr = 65535;
 
-    /* 停表 → 写 PSC/ARR → 生成更新装载 → 清标志 → 重启 */
-    __HAL_TIM_DISABLE(htim);
-    __HAL_TIM_SET_PRESCALER(htim, psc);
-    __HAL_TIM_SET_AUTORELOAD(htim, arr);
-    __HAL_TIM_SET_COUNTER(htim, 0);
-    htim->Instance->EGR = TIM_EGR_UG;      /* 生成更新事件, 装载 PSC/ARR */
-    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_UPDATE);
-    s->phase = 0;
-    __HAL_TIM_ENABLE(htim);
+    running = (htim->Instance->CR1 & TIM_CR1_CEN) ? 1U : 0U;
+
+    if (!running) {
+        /* 启动: 停表 → 写 PSC/ARR → 更新装载 → 清标志 → 重启 */
+        __HAL_TIM_DISABLE(htim);
+        __HAL_TIM_SET_PRESCALER(htim, psc);
+        __HAL_TIM_SET_AUTORELOAD(htim, arr);
+        __HAL_TIM_SET_COUNTER(htim, 0);
+        htim->Instance->EGR = TIM_EGR_UG;      /* 生成更新事件, 装载 PSC/ARR */
+        __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_UPDATE);
+        s->phase = 0;
+        __HAL_TIM_ENABLE(htim);
+    } else {
+        /* 运行中: 仅更新影子寄存器, 当前周期结束后自然生效 */
+        htim->Instance->CR1 |= TIM_CR1_ARPE;   /* 使能 ARR 预装载 */
+        __HAL_TIM_SET_PRESCALER(htim, psc);
+        __HAL_TIM_SET_AUTORELOAD(htim, arr);
+    }
     s->step_rate = rate;
 }
 

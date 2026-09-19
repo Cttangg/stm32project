@@ -99,6 +99,13 @@ void  MotorPID_RescaleMicrostep(MotorPID *p, float old_ms, float new_ms);
 /** @brief 设定目标角度并使能 (无 derivative kick, 平滑起步) */
 void  MotorPID_SetTarget(MotorPID *p, float target_deg);
 
+/**
+ * @brief 连续轨迹更新目标 (每个控制周期调用, 不重置积分/速度)
+ *        用于运动层沿路径连续推进设定点: D 作用在测量值, 目标变化
+ *        不产生 derivative kick, 因此无需清积分; 保留积分可消除跟随静差.
+ */
+void  MotorPID_SetTargetContinuous(MotorPID *p, float target_deg);
+
 /** @brief 停止控制 (状态→DISABLED) */
 void  MotorPID_Disable(MotorPID *p);
 

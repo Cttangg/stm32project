@@ -74,6 +74,18 @@ void MotorPID_SetTarget(MotorPID *p, float target_deg) {
     p->enabled      = 1;
 }
 
+/* 连续轨迹设定点更新: 只改目标, 不打断积分/速度状态机 */
+void MotorPID_SetTargetContinuous(MotorPID *p, float target_deg) {
+    p->target = target_deg;
+    if (!p->enabled) {
+        p->enabled      = 1;
+        p->last_current = p->current;
+        p->filtered_vel = 0.0f;
+    }
+    if (p->state == MOTOR_PID_DISABLED)
+        p->state = MOTOR_PID_MOVING;
+}
+
 void MotorPID_Disable(MotorPID *p) {
     p->enabled    = 0;
     p->state      = MOTOR_PID_DISABLED;
