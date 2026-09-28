@@ -51,12 +51,27 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Lib/motor_pid.c
     Core/Lib/motor_stepper.c
     Core/Lib/st7735.c
+    Core/axis/axis.c
+    Core/safety/safety.c
+    Core/motion/motion.c
+    Core/communication/communication.c
+    Core/tracking/coordinate_transform.c
+    Core/tracking/tracking_manager.c
+    Core/app/app.c
+    Core/telemetry/telemetry.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     Core/Lib
+    Core/axis
+    Core/safety
+    Core/motion
+    Core/communication
+    Core/tracking
+    Core/app
+    Core/telemetry
 )
 
 # Add project symbols (macros)

@@ -27,6 +27,13 @@
 #include "motor_pid.h"
 #include "motor_stepper.h"
 #include "uart.h"
+#include "axis.h"
+#include "safety.h"
+#include "motion.h"
+#include "communication.h"
+#include "tracking_manager.h"
+#include "app.h"
+#include "telemetry.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -76,6 +83,25 @@ static MotorPID pid_pan;
 
 /* 串口库设备: USART1 调试口, USART2 摄像头 */
 static UART_Device uart_dbg, uart_cam;
+
+/* 单轴抽象: 统一封装 PID/驱动/编码器/步进引擎 (Pan/Tilt 共用同一结构) */
+static Axis axis_tilt;
+static Axis axis_pan;
+
+/* 安全管理器 */
+static SafetyConfig safety_cfg;
+
+/* 运动管理器 */
+static MotionConfig motion_cfg;
+
+/* 追踪管理器 */
+static TrackingConfig tracking_cfg;
+
+/* 应用状态机 */
+static AppConfig app_cfg;
+
+/* 遥测 */
+static uint32_t telemetry_tick;
 
 /* USER CODE END PV */
 
@@ -179,6 +205,54 @@ int main(void)
   UART_Open(&uart_dbg);
   UART_Open(&uart_cam);
 
+  /* 通信管理器: 摄像头视觉帧解析 → VisionTarget */
+  Communication_Init(&uart_cam);
+
+  /* 单轴抽象: 包装 编码器 + PID + 步进引擎 + 驱动 */
+  Axis_Init(&axis_tilt, &pid_tilt, &motor_tilt, &enc_tilt, &stepper_tilt);
+  Axis_Init(&axis_pan,  &pid_pan,  &motor_pan,  &enc_pan,  &stepper_pan);
+
+  /* 限位 (默认 ±180°, 按实际机械行程修改; 控制参数保留 PID 默认值) */
+  Axis_SetLimits(&axis_tilt, -180.0f, 180.0f);
+  Axis_SetLimits(&axis_pan,  -180.0f, 180.0f);
+
+  Axis_Enable(&axis_tilt);
+  Axis_Enable(&axis_pan);
+
+  /* 安全: 绑定轴, 使能按键暂停 */
+  safety_cfg.pan = &axis_pan;
+  safety_cfg.tilt = &axis_tilt;
+  safety_cfg.enable_key_pause = true;
+  Safety_Init(&safety_cfg);
+
+  /* 运动: 绑定 Pan/Tilt 轴 */
+  motion_cfg.pan = &axis_pan;
+  motion_cfg.tilt = &axis_tilt;
+  Motion_Init(&motion_cfg);
+
+  /* 追踪: 像素→角度系数/死区/滤波/超时 (默认值, 按实际相机标定修改) */
+  tracking_cfg.center_x         = 320.0f;
+  tracking_cfg.center_y         = 240.0f;
+  tracking_cfg.pixel_to_angle_x = 0.05f;   /* deg/px, 占位 */
+  tracking_cfg.pixel_to_angle_y = 0.05f;   /* deg/px, 占位 */
+  tracking_cfg.deadband_x       = 8.0f;    /* px */
+  tracking_cfg.deadband_y       = 8.0f;    /* px */
+  tracking_cfg.filter_alpha     = 0.4f;
+  tracking_cfg.vision_timeout_ms = 200;    /* 200ms 未更新 → LOST */
+  tracking_cfg.acquire_frames   = 5;       /* 连续 5 帧进入 TRACK */
+  Tracking_Init(&tracking_cfg, &motion_cfg);
+  Tracking_SetEnabled(false);              /* 默认关闭, 由 App 状态机控制 */
+
+  /* 应用状态机: 绑定安全/运动, 初始 IDLE */
+  app_cfg.safety = &safety_cfg;
+  app_cfg.motion = &motion_cfg;
+  app_cfg.search_pan_deg = 0.0f;
+  App_Init(&app_cfg);
+
+  /* 遥测 */
+  Telemetry_Init(&axis_pan, &axis_tilt);
+  telemetry_tick = 0;
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -187,13 +261,38 @@ int main(void)
   {
     /* 串口帧解析/回调 (必须周期调用) */
     UART_Task(&uart_dbg);
-    UART_Task(&uart_cam);
 
-    /* 位置闭环 5ms 周期 (占位, 待应用逻辑):
-       MotorPID_Update(&pid_tilt, MT6701_ReadDegrees(&enc_tilt), 0.005f);
-       MotorPID_Update(&pid_pan,  MT6701_ReadDegrees(&enc_pan),  0.005f);
-       MotorStepper_SetVelocity(&stepper_tilt, pid_tilt.vel_ref);
-       MotorStepper_SetVelocity(&stepper_pan,  pid_pan.vel_ref); */
+    /* 通信管理器: 摄像头帧解析 + 视觉超时维护 */
+    Communication_Update(HAL_GetTick());
+
+    /* 追踪管理器: 消费视觉目标 → 输出云台 setpoint (先消费再更新) */
+    {
+        VisionTarget vt;
+        if (Communication_PopVisionTarget(&vt)) {
+            Tracking_SetVisionTarget(&vt);
+        }
+    }
+    Tracking_Update(HAL_GetTick());
+
+    /* 应用状态机: 协调 Tracking/Motion/Safety */
+    App_Update(HAL_GetTick());
+
+    /* 遥测: 50Hz 采样 (只读, 不参与控制) */
+    {
+        uint32_t now = HAL_GetTick();
+        if ((now - telemetry_tick) >= 20) {
+            telemetry_tick = now;
+            Telemetry_Sample(now);
+        }
+    }
+
+    /* 单轴闭环 5ms 周期 (Axis 内部: 编码器 → PID → 步进驱动) */
+    Motion_Update(0.005f);
+    Axis_Update(&axis_tilt, 0.005f);
+    Axis_Update(&axis_pan,  0.005f);
+
+    /* 安全监控: 按键/轴故障/限位 (故障时阻止运动) */
+    Safety_Update(HAL_GetTick());
 
     /* USER CODE END WHILE */
 
@@ -566,7 +665,7 @@ static void MX_GPIO_Init(void)
                           |EN_2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, EN_1_Pin|MS1_1_Pin|MS2_1_Pin|STEP_1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, EN_1_Pin|MS1_1_Pin|MS2_1_BK_Pin|STEP_1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : LCD_DC_Pin LCD_RES_Pin DIR_1_Pin */
   GPIO_InitStruct.Pin = LCD_DC_Pin|LCD_RES_Pin|DIR_1_Pin;
@@ -591,23 +690,29 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : EN_1_Pin MS1_1_Pin MS2_1_Pin STEP_1_Pin */
-  GPIO_InitStruct.Pin = EN_1_Pin|MS1_1_Pin|MS2_1_Pin|STEP_1_Pin;
+  /*Configure GPIO pins : EN_1_Pin MS1_1_Pin MS2_1_BK_Pin STEP_1_Pin */
+  GPIO_InitStruct.Pin = EN_1_Pin|MS1_1_Pin|MS2_1_BK_Pin|STEP_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : MS2_1_Pin */
+  GPIO_InitStruct.Pin = MS2_1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(MS2_1_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pins : KEY_PAUSE_Pin KEY_RESET_Pin KEY_TRACK_Pin KEY_BORDER_Pin */
   GPIO_InitStruct.Pin = KEY_PAUSE_Pin|KEY_RESET_Pin|KEY_TRACK_Pin|KEY_BORDER_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : KEY_CALIB_Pin KEY_A4_Pin */
   GPIO_InitStruct.Pin = KEY_CALIB_Pin|KEY_A4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
