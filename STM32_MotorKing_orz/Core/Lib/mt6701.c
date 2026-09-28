@@ -168,11 +168,12 @@ int MT6701_Init(MT6701_HandleTypeDef *h, I2C_HandleTypeDef *hi2c) {
 uint16_t MT6701_ReadRaw(MT6701_HandleTypeDef *h) {
     uint8_t buf[2];
     uint16_t raw, delta;
-    if (!h->inited) return 0;
+    if (!h->inited) return 0xFFFFu;
     if (!mt6701_read_reg(h, MT6701_REG_ANGLE_MSB, buf, 2)) {
-        /* 读失败: 返回上次有效值 (0 是合法角度, 不能用作失败哨兵).
-           由 Axis 依赖 MT6701_IsMagnetOK/IsDataUpdated 判定编码器状态 */
-        return h->last_raw;
+        /* 读失败: 返回哨兵 0xFFFF (非法值, 调用方据此判定读失败).
+           注意: 绝不能返回 last_raw —— 闭环中冻结读数会让 PID
+           在编码器失效时继续满速驱动电机 (电机空转/绕线). */
+        return 0xFFFFu;
     }
 
     /* MT6701 14-bit 寄存器拼合：[0x03]: D13~D6, [0x04]: D5~D0 在高 6 位 */
@@ -182,14 +183,15 @@ uint16_t MT6701_ReadRaw(MT6701_HandleTypeDef *h) {
     /* 跳变校验: I2C 偶发故障可能读到脏数据 (角度突变).
        计算与上次值的带环绕最短差, 超过阈值视为脏读数, 丢弃并保持上次值.
        阈值 = 30° / 0.022° per LSB ≈ 1365 LSB (正常运动 5ms 采样 < 6°, 安全裕量).
-       首读 (last_raw 未初始化 = 0xFFFF) 直接接受 */
+       首读 (last_raw 未初始化 = 0xFFFF) 直接接受.
+       注意: 脏读数也返回哨兵 0xFFFF, 由调用方决定本次更新是否使用 */
     if (h->last_raw != 0xFFFFu) {
         delta = (uint16_t)((raw > h->last_raw) ? (raw - h->last_raw) : (h->last_raw - raw));
         if (delta > MT6701_CPR / 2u) {
             delta = (uint16_t)(MT6701_CPR - delta);   /* 环绕最短差 */
         }
         if (delta > 1365u) {
-            return h->last_raw;                       /* 脏读数: 保持上次 */
+            return 0xFFFFu;                           /* 脏读数: 本次无效 */
         }
     }
 
@@ -198,6 +200,7 @@ uint16_t MT6701_ReadRaw(MT6701_HandleTypeDef *h) {
 }
 
 float MT6701_ReadDegrees(MT6701_HandleTypeDef *h) {
+    /* 读失败返回哨兵 raw 0xFFFF → 719.8° (非法值, 调用方检测) */
     return (float)MT6701_ReadRaw(h) * MT6701_LSB_DEG;
 }
 

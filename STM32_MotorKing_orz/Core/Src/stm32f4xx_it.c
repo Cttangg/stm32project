@@ -51,6 +51,20 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* 崩溃诊断: HardFault 现场保存到固定 RAM (复位后由 App 上报) */
+#define FAULT_DIAG_ADDR  0x2001FF00u
+void HardFault_SaveContext(void)
+{
+    volatile uint32_t *f = (volatile uint32_t *)FAULT_DIAG_ADDR;
+    f[0] = __get_BASEPRI();
+    f[1] = __get_CONTROL();
+    f[2] = __get_MSP();
+    f[3] = __get_PSP();
+    f[4] = *(volatile uint32_t *)(__get_MSP());      /* 返回地址 (栈顶) */
+    f[5] = *(volatile uint32_t *)(__get_MSP() + 4);  /* LR */
+    f[6] = 0xA5A5A5A5u;                               /* 有效标记 */
+}
+/* USER CODE END 0 */
 #include "motor_stepper.h"
 /* USER CODE END 0 */
 
@@ -94,7 +108,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  HardFault_SaveContext();
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {

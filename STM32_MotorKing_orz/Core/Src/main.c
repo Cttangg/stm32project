@@ -126,6 +126,11 @@ static float    spin_last_angle;
 static uint32_t spin_t0;
 static uint32_t spin_sample_next;
 
+/* 编码器失效保护: 连续读失败计数 (裸 PID 模式, 超阈值停轴防空转) */
+static uint8_t  enc_fail_pan;
+static uint8_t  enc_fail_tilt;
+#define ENC_FAIL_LIMIT  5   /* 连续 5 次失败 → 停轴 */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -291,6 +296,10 @@ int main(void)
   swing_next_ms    = 0;
   swing_period_ms  = 1000;                   /* 每方向 1s */
 
+  /* 编码器失效保护计数清零 */
+  enc_fail_pan  = 0;
+  enc_fail_tilt = 0;
+
   /* 开环走圈测试初始关闭 */
   spin_active      = 0;
   spin_start_angle = 0.0f;
@@ -333,19 +342,38 @@ int main(void)
     }
     */
 
-    /* ── PID 闭环测试模式: 电机1/Tilt 用 MotorPID 闭环 (验证步进修复) ── */
+    /* ── PID 闭环测试模式: 双轴裸 PID (编码器失效保护) ── */
     DbgCmd_SwingUpdate(HAL_GetTick());   /* 摆动目标直接喂 PID (Tilt 单轴) */
     DbgCmd_SpinUpdate(HAL_GetTick());    /* 开环走圈 (与 PID 互斥, 由命令控制) */
 
     /* 位置闭环 5ms: 编码器 → MotorPID → MotorStepper (双轴裸 PID)
-       spin 开环走圈期间暂停 PID, 避免 MoveSteps 与 SetVelocity 冲突 */
+       spin 开环走圈期间暂停 PID, 避免 MoveSteps 与 SetVelocity 冲突
+       编码器读失败 (0xFFFF 哨兵) 连续 ENC_FAIL_LIMIT 次 → 停轴, 防堵转/空转 */
     if (!spin_active) {
-        /* Tilt (TIM14): 方向标定 = 反转 (实测 CCW→读数递减) */
-        MotorPID_Update(&pid_tilt, MT6701_ReadDegrees(&enc_tilt), 0.005f);
-        MotorStepper_SetVelocity(&stepper_tilt, -pid_tilt.vel_ref);
-        /* Pan (TIM13): 方向待实测, 先与 Tilt 相同假设 */
-        MotorPID_Update(&pid_pan,  MT6701_ReadDegrees(&enc_pan),  0.005f);
-        MotorStepper_SetVelocity(&stepper_pan, -pid_pan.vel_ref);
+        float t_ang = MT6701_ReadDegrees(&enc_tilt);
+        float p_ang = MT6701_ReadDegrees(&enc_pan);
+
+        /* Tilt: 读失败则计数, 超阈值停轴 */
+        if (t_ang > 360.0f) {
+            if (++enc_fail_tilt >= ENC_FAIL_LIMIT) {
+                MotorStepper_SetVelocity(&stepper_tilt, 0.0f);
+            }
+        } else {
+            enc_fail_tilt = 0;
+            MotorPID_Update(&pid_tilt, t_ang, 0.005f);
+            MotorStepper_SetVelocity(&stepper_tilt, -pid_tilt.vel_ref);
+        }
+
+        /* Pan: 同上 */
+        if (p_ang > 360.0f) {
+            if (++enc_fail_pan >= ENC_FAIL_LIMIT) {
+                MotorStepper_SetVelocity(&stepper_pan, 0.0f);
+            }
+        } else {
+            enc_fail_pan = 0;
+            MotorPID_Update(&pid_pan, p_ang, 0.005f);
+            MotorStepper_SetVelocity(&stepper_pan, -pid_pan.vel_ref);
+        }
     } else {
         MT6701_ReadDegrees(&enc_tilt);   /* spin 期间 I2C 只读 */
     }
@@ -895,6 +923,24 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                                                "PAN=%.2f (tgt=%.2f) TILT=%.2f (tgt=%.2f)\r\n",
                                                MT6701_ReadDegrees(&enc_pan), pid_pan.target,
                                                MT6701_ReadDegrees(&enc_tilt), pid_tilt.target);
+                            uint16_t w = 0;
+                            if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
+                        }
+                    } else if (strcmp(cmd, "fault") == 0) {
+                        /* 读取上次 HardFault 现场 (诊断) */
+                        {
+                            volatile uint32_t *f = (volatile uint32_t *)0x2001FF00u;
+                            uint8_t tmp[96];
+                            int len;
+                            if (f[6] == 0xA5A5A5A5u) {
+                                len = snprintf((char *)tmp, sizeof(tmp),
+                                    "FAULT MSP=%08x PSP=%08x RET=%08x LR=%08x\r\n",
+                                    (unsigned)f[2], (unsigned)f[3],
+                                    (unsigned)f[4], (unsigned)f[5]);
+                            } else {
+                                len = snprintf((char *)tmp, sizeof(tmp),
+                                    "FAULT none\r\n");
+                            }
                             uint16_t w = 0;
                             if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
                         }
