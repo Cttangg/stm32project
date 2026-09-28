@@ -224,6 +224,10 @@ int main(void)
   /* 位置闭环 PID (默认 1/32 细分标定) */
   MotorPID_Init(&pid_tilt);
   MotorPID_Init(&pid_pan);
+  /* Pan PID 整定 (实测 2026-09-29): kp=700 ki=100 kd=350
+     正向过冲 0.17°, 无高频抖动, 精确锁定 ±0.04°
+     (默认 kp=1500/kd=125 会导致 Pan 目标附近极限环振荡 ±2.5°) */
+  MotorPID_SetGains(&pid_pan, 700.0f, 100.0f, 350.0f);
 
   /* 串口库: USART1 调试口 + USART2 摄像头 (RX DMA 需为 Circular) */
   UART_Init(&uart_dbg, &huart1);
@@ -788,6 +792,7 @@ static void MX_GPIO_Init(void)
  *   swing <amp>     → 以当前位置为原点, Tilt 小幅摆动 ±amp 度
  *   swing stop      → 停止摆动, 回原点
  *   spin            → Tilt 开环走 1 圈 (验证回正)
+ *   pid <kp> <ki> <kd> → 在线调整 Pan PID 增益
  *   boot            → 跳回 Bootloader (等主机烧录)
  *   pos             → 打印当前 Pan/Tilt 位置
  *   例: "go 200 30\r"  "swing 5\r"  "stop\r"  "boot\r"  "pos\r"
@@ -831,6 +836,23 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                         MotorPID_SetTarget(&pid_tilt, MT6701_ReadDegrees(&enc_tilt));
                         MotorStepper_SetVelocity(&stepper_pan,  0.0f);
                         MotorStepper_SetVelocity(&stepper_tilt, 0.0f);
+                    } else if (strcmp(cmd, "pid") == 0) {
+                        /* 在线调整 Pan PID: pid <kp> <ki> <kd> (作用于 Pan 轴) */
+                        {
+                            float kp, ki, kd;
+                            char *p = (char *)dbg_cmd_buf + 4;
+                            kp = DbgCmd_ParseFloat(p, &endp);
+                            if (endp) { ki = DbgCmd_ParseFloat(endp, &endp); }
+                            if (endp) { kd = DbgCmd_ParseFloat(endp, &endp); }
+                            if (endp && kp >= 0 && ki >= 0 && kd >= 0) {
+                                MotorPID_SetGains(&pid_pan, kp, ki, kd);
+                                { uint8_t e[48]; int l = snprintf((char*)e, sizeof(e),
+                                      "PID-PAN kp=%.0f ki=%.0f kd=%.0f\r\n", kp, ki, kd);
+                                  uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                            } else {
+                                { uint8_t e[]="PID-FMT: pid <kp> <ki> <kd>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                            }
+                        }
                     } else if (strcmp(cmd, "swing") == 0) {
                         /* 手动解析 amp */
                         endp = NULL;
@@ -886,20 +908,19 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                             if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
                         }
                     } else if (strcmp(cmd, "stat") == 0) {
-                        /* 打印 Tilt 裸 PID 状态 (诊断) */
+                        /* 打印双轴 PID 状态 (诊断) */
                         {
                             uint8_t tmp[160];
-                            uint16_t tilt_raw = MT6701_ReadRaw(&enc_tilt);
-                            HAL_StatusTypeDef i2c1_ready = HAL_I2C_IsDeviceReady(&hi2c1, 0x0C, 3, 10);
                             int len = snprintf((char *)tmp, sizeof(tmp),
-                                               "T:tgt=%.1f cur=%.1f vr=%.0f st=%d en=%d raw=%u i2c1=%d\r\n",
+                                               "P:tgt=%.1f cur=%.1f vr=%.0f st=%d | T:tgt=%.1f cur=%.1f vr=%.0f st=%d\r\n",
+                                               pid_pan.target,
+                                               pid_pan.current,
+                                               pid_pan.vel_ref,
+                                               (int)pid_pan.state,
                                                pid_tilt.target,
                                                pid_tilt.current,
                                                pid_tilt.vel_ref,
-                                               (int)pid_tilt.state,
-                                               (int)pid_tilt.enabled,
-                                               (unsigned)tilt_raw,
-                                               (int)i2c1_ready);
+                                               (int)pid_tilt.state);
                             uint16_t w = 0;
                             if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
                         }
