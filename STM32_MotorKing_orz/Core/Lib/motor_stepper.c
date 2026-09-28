@@ -34,6 +34,15 @@ static void stepper_set_rate(MotorStepper *s, float rate) {
     if (rate <= 0.0f) { MotorStepper_Stop(s); return; }
     if (rate > 50000.0f) rate = 50000.0f;      /* 保护上限 */
 
+    /* 关键: 频率未变化时直接返回, 不触碰定时器.
+       PID 每 5ms 调用 SetVelocity, 若 vel_ref 变化小 (如收敛中),
+       频繁停表重启会丢失定时器连续性 → 丢步/抖动. */
+    if (s->step_rate != 0.0f) {
+        float diff = rate - s->step_rate;
+        if (diff < 0.0f) diff = -diff;
+        if (diff < 1.0f) return;               /* 频率差 < 1 steps/s: 忽略 */
+    }
+
     /* (PSC+1)(ARR+1) = 时钟 / (2×rate) */
     d = (uint64_t)((double)STEP_TIM_CLK / (2.0 * (double)rate));
     if (d < 1) d = 1;

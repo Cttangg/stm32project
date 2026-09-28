@@ -111,14 +111,20 @@ static uint8_t     dbg_cmd_buf[32];
 static uint16_t    dbg_cmd_len;
 static char        dbg_last_cmd[33];   /* 诊断: 最近完整命令 */
 
-/* 摆动测试状态: 以启动时的位置为原点, 小幅摆动 ±amp 度 (双轴同幅) */
+/* 摆动测试状态: 以启动时的位置为原点, 小幅摆动 ±amp 度 (仅 Tilt) */
 static uint8_t  swing_active;
 static float    swing_amp;
-static float    swing_pan_origin;
 static float    swing_tilt_origin;
 static int      swing_dir;         /* +1 / -1 */
 static uint32_t swing_next_ms;
 static uint32_t swing_period_ms;   /* 每个方向停留时间 */
+
+/* 开环走圈测试状态 (spin): MoveSteps 走 1 圈, 周期采样编码器角度, 验证回正 */
+static uint8_t  spin_active;
+static float    spin_start_angle;
+static float    spin_last_angle;
+static uint32_t spin_t0;
+static uint32_t spin_sample_next;
 
 /* USER CODE END PV */
 
@@ -136,6 +142,7 @@ static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
 static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len);
 static void DbgCmd_SwingUpdate(uint32_t now_ms);
+static void DbgCmd_SpinUpdate(uint32_t now_ms);
 static float DbgCmd_ParseFloat(const char *s, char **end);
 /* USER CODE END PFP */
 
@@ -227,7 +234,8 @@ int main(void)
   /* 通信管理器: 摄像头视觉帧解析 → VisionTarget (Phase 4, 暂时注释)
   Communication_Init(&uart_cam); */
 
-  /* 单轴抽象: 包装 编码器 + PID + 步进引擎 + 驱动 */
+  /* 单轴抽象: 包装 编码器 + PID + 步进引擎 + 驱动
+     (裸 PID 测试模式: 仅电机1/Tilt 使能, 电机2/Pan 保持禁用) */
   Axis_Init(&axis_tilt, &pid_tilt, &motor_tilt, &enc_tilt, &stepper_tilt);
   Axis_Init(&axis_pan,  &pid_pan,  &motor_pan,  &enc_pan,  &stepper_pan);
 
@@ -241,6 +249,10 @@ int main(void)
 
   Axis_Enable(&axis_tilt);
   Axis_Enable(&axis_pan);
+
+  /* 裸 PID 模式: 用 MotorPID_SetTarget 使能双轴 PID, 目标 = 当前位置 */
+  MotorPID_SetTarget(&pid_tilt, MT6701_ReadDegrees(&enc_tilt));
+  MotorPID_SetTarget(&pid_pan,  MT6701_ReadDegrees(&enc_pan));
 
   /* 安全: 绑定轴, 使能按键暂停 */
   safety_cfg.pan = &axis_pan;
@@ -270,11 +282,17 @@ int main(void)
   /* 摆动测试初始关闭 */
   swing_active     = 0;
   swing_amp        = 5.0f;                   /* 默认 ±5° */
-  swing_pan_origin = 0.0f;
   swing_tilt_origin = 0.0f;
   swing_dir        = 1;
   swing_next_ms    = 0;
   swing_period_ms  = 1000;                   /* 每方向 1s */
+
+  /* 开环走圈测试初始关闭 */
+  spin_active      = 0;
+  spin_start_angle = 0.0f;
+  spin_last_angle  = 0.0f;
+  spin_t0          = 0;
+  spin_sample_next = 0;
 
   /* 上电自检标志: 验证 App 是否正常启动 (诊断用) */
   {
@@ -311,13 +329,24 @@ int main(void)
     }
     */
 
-    /* 运动: Safety 检查 + 目标下发 (Phase 3) */
-    DbgCmd_SwingUpdate(HAL_GetTick());
-    Motion_Update(0.005f);
+    /* ── PID 闭环测试模式: 电机1/Tilt 用 MotorPID 闭环 (验证步进修复) ── */
+    DbgCmd_SwingUpdate(HAL_GetTick());   /* 摆动目标直接喂 PID (Tilt 单轴) */
+    DbgCmd_SpinUpdate(HAL_GetTick());    /* 开环走圈 (与 PID 互斥, 由命令控制) */
 
-    /* 单轴闭环 5ms 周期 (Axis 内部: 编码器 → PID → 步进驱动) */
-    Axis_Update(&axis_tilt, 0.005f);
-    Axis_Update(&axis_pan,  0.005f);
+    /* 位置闭环 5ms: 编码器 → MotorPID → MotorStepper (双轴裸 PID)
+       spin 开环走圈期间暂停 PID, 避免 MoveSteps 与 SetVelocity 冲突 */
+    if (!spin_active) {
+        /* Tilt (TIM14): 方向标定 = 反转 (实测 CCW→读数递减) */
+        MotorPID_Update(&pid_tilt, MT6701_ReadDegrees(&enc_tilt), 0.005f);
+        MotorStepper_SetVelocity(&stepper_tilt, -pid_tilt.vel_ref);
+        /* Pan (TIM13): 方向待实测, 先与 Tilt 相同假设 */
+        MotorPID_Update(&pid_pan,  MT6701_ReadDegrees(&enc_pan),  0.005f);
+        MotorStepper_SetVelocity(&stepper_pan, -pid_pan.vel_ref);
+    } else {
+        MT6701_ReadDegrees(&enc_tilt);   /* spin 期间 I2C 只读 */
+    }
+
+    /* 电机2/Pan: 不调用任何 Update (驱动已 Disable) */
 
     /* 安全监控: 按键/轴故障/限位 (故障时阻止运动) */
     Safety_Update(HAL_GetTick());
@@ -754,13 +783,14 @@ static void MX_GPIO_Init(void)
  * @brief 调试命令逐字节回调 (Phase 3 验收驱动)
  *
  * 命令格式 (USART1 调试口, 以 \r 或 \n 结尾):
- *   go <pan> <tilt>  → 双轴运动到指定角度 (自动限幅)
- *   stop             → 停止双轴 (保持当前位置)
- *   swing <amp>      → 以当前位置为原点, 双轴小幅摆动 ±amp 度
- *   swing stop       → 停止摆动, 回原点
- *   boot             → 跳回 Bootloader (等主机烧录)
- *   pos              → 打印当前 Pan/Tilt 位置
- *   例: "go 40 20\r"  "swing 5\r"  "swing stop\r"  "stop\r"  "boot\r"  "pos\r"
+ *   go <pan> <tilt> → 双轴裸 PID 运动到指定角度
+ *   stop            → 停止双轴 (保持当前位置)
+ *   swing <amp>     → 以当前位置为原点, Tilt 小幅摆动 ±amp 度
+ *   swing stop      → 停止摆动, 回原点
+ *   spin            → Tilt 开环走 1 圈 (验证回正)
+ *   boot            → 跳回 Bootloader (等主机烧录)
+ *   pos             → 打印当前 Pan/Tilt 位置
+ *   例: "go 200 30\r"  "swing 5\r"  "stop\r"  "boot\r"  "pos\r"
  */
 static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
 {
@@ -779,15 +809,16 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                 dbg_last_cmd[sizeof(dbg_last_cmd) - 1] = '\0';
                 if (sscanf((char *)dbg_cmd_buf, "%31s", cmd) == 1) {
                     if (strcmp(cmd, "go") == 0) {
-                        /* 手动解析浮点 (nano 库 strtof/scanf %f 不可靠) */
+                        /* 手动解析浮点, 双轴裸 PID */
                         endp = NULL;
                         pan  = DbgCmd_ParseFloat((char *)dbg_cmd_buf + 3, &endp);
                         if (endp) {
                             tilt = DbgCmd_ParseFloat(endp, &endp);
                             if (endp) {
-                                swing_active = 0;          /* 手动目标覆盖摆动 */
-                                Motion_SetTarget(pan, tilt);
-                                { uint8_t e[48]; int l = snprintf((char*)e, sizeof(e), "GO->%.1f %.1f\r\n", pan, tilt); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                                swing_active = 0;              /* 手动目标覆盖摆动 */
+                                MotorPID_SetTarget(&pid_pan,  pan);
+                                MotorPID_SetTarget(&pid_tilt, tilt);
+                                { uint8_t e[48]; int l = snprintf((char*)e, sizeof(e), "GO->PAN %.1f TILT %.1f\r\n", pan, tilt); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
                             } else {
                                 { uint8_t e[]="GO-TILT-FAIL\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
                             }
@@ -796,36 +827,52 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                         }
                     } else if (strcmp(cmd, "stop") == 0) {
                         swing_active = 0;
-                        Motion_Stop();
+                        MotorPID_SetTarget(&pid_pan,  MT6701_ReadDegrees(&enc_pan));
+                        MotorPID_SetTarget(&pid_tilt, MT6701_ReadDegrees(&enc_tilt));
+                        MotorStepper_SetVelocity(&stepper_pan,  0.0f);
+                        MotorStepper_SetVelocity(&stepper_tilt, 0.0f);
                     } else if (strcmp(cmd, "swing") == 0) {
-                        /* strtof 解析 amp */
+                        /* 手动解析 amp */
                         endp = NULL;
                         amp  = DbgCmd_ParseFloat((char *)dbg_cmd_buf + 6, &endp);
                         if (endp) {
-                            /* 启动摆动: 以当前位置为原点 */
+                            /* 启动摆动: 以 Tilt 当前位置为原点 */
                             swing_active      = 1;
                             swing_amp         = (amp < 1.0f) ? 1.0f : amp;
-                            swing_pan_origin  = Axis_GetPosition(&axis_pan);
-                            swing_tilt_origin = Axis_GetPosition(&axis_tilt);
+                            swing_tilt_origin = MT6701_ReadDegrees(&enc_tilt);
                             swing_dir         = 1;
                             swing_next_ms     = HAL_GetTick() + swing_period_ms;
-                            Motion_SetTarget(swing_pan_origin + swing_dir * swing_amp,
-                                             swing_tilt_origin + swing_dir * swing_amp);
+                            MotorPID_SetTarget(&pid_tilt,
+                                               swing_tilt_origin + swing_dir * swing_amp);
                         } else {
                             swing_active = 0;          /* "swing stop" */
-                            Motion_SetTarget(swing_pan_origin, swing_tilt_origin);
+                            MotorPID_SetTarget(&pid_tilt, swing_tilt_origin);
                         }
+                    } else if (strcmp(cmd, "spin") == 0) {
+                        /* 开环走 1 整圈 (6400 步 @ 2000 steps/s ≈ 3.2s), I2C 周期采样验证回正 */
+                        swing_active = 0;
+                        spin_active      = 1;
+                        spin_start_angle = MT6701_ReadDegrees(&enc_tilt);
+                        spin_last_angle  = spin_start_angle;
+                        spin_t0          = HAL_GetTick();
+                        spin_sample_next = spin_t0;
+                        MotorStepper_MoveSteps(&stepper_tilt,
+                                               (uint32_t)STEPS_PER_REV, 2000.0f);
+                        { uint8_t e[48]; int l = snprintf((char*)e, sizeof(e),
+                              "SPIN-START a=%.1f steps=%u\r\n",
+                              spin_start_angle, (unsigned)STEPS_PER_REV);
+                          uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
                     } else if (strcmp(cmd, "boot") == 0) {
                         /* 跳回 Bootloader 等待主机烧录 */
                         APP_JumpToBootloader();
                     } else if (strcmp(cmd, "pos") == 0) {
-                        /* 打印当前 Pan/Tilt 位置 (调试口) */
+                        /* 打印双轴当前位置 (裸 PID 模式) */
                         {
-                            uint8_t tmp[64];
+                            uint8_t tmp[80];
                             int len = snprintf((char *)tmp, sizeof(tmp),
-                                               "PAN=%.2f TILT=%.2f\r\n",
-                                               Axis_GetPosition(&axis_pan),
-                                               Axis_GetPosition(&axis_tilt));
+                                               "PAN=%.2f (tgt=%.2f) TILT=%.2f (tgt=%.2f)\r\n",
+                                               MT6701_ReadDegrees(&enc_pan), pid_pan.target,
+                                               MT6701_ReadDegrees(&enc_tilt), pid_tilt.target);
                             uint16_t w = 0;
                             if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
                         }
@@ -839,21 +886,18 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                             if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
                         }
                     } else if (strcmp(cmd, "stat") == 0) {
-                        /* 打印轴状态/故障/编码器 + I2C1 器件探测 (诊断) */
+                        /* 打印 Tilt 裸 PID 状态 (诊断) */
                         {
                             uint8_t tmp[160];
-                            float tilt_angle = -1.0f;
                             uint16_t tilt_raw = MT6701_ReadRaw(&enc_tilt);
                             HAL_StatusTypeDef i2c1_ready = HAL_I2C_IsDeviceReady(&hi2c1, 0x0C, 3, 10);
-                            if (tilt_raw != 0) tilt_angle = (float)tilt_raw * MT6701_LSB_DEG;
                             int len = snprintf((char *)tmp, sizeof(tmp),
-                                               "P:tgt=%.1f vr=%.0f st=%d flt=%d | T:st=%d flt=%d raw=%u i2c1=%d\r\n",
-                                               pid_pan.target,
-                                               pid_pan.vel_ref,
-                                               (int)Axis_GetState(&axis_pan),
-                                               (int)axis_pan.fault,
-                                               (int)Axis_GetState(&axis_tilt),
-                                               (int)axis_tilt.fault,
+                                               "T:tgt=%.1f cur=%.1f vr=%.0f st=%d en=%d raw=%u i2c1=%d\r\n",
+                                               pid_tilt.target,
+                                               pid_tilt.current,
+                                               pid_tilt.vel_ref,
+                                               (int)pid_tilt.state,
+                                               (int)pid_tilt.enabled,
                                                (unsigned)tilt_raw,
                                                (int)i2c1_ready);
                             uint16_t w = 0;
@@ -911,8 +955,44 @@ static void DbgCmd_SwingUpdate(uint32_t now_ms)
         now_ms >= swing_next_ms) {
         swing_dir = -swing_dir;
         swing_next_ms = now_ms + swing_period_ms;
-        Motion_SetTarget(swing_pan_origin + swing_dir * swing_amp,
-                         swing_tilt_origin + swing_dir * swing_amp);
+        MotorPID_SetTarget(&pid_tilt,
+                           swing_tilt_origin + swing_dir * swing_amp);
+    }
+}
+
+/**
+ * @brief 开环走圈测试状态机 (主循环调用)
+ *
+ * spin 命令触发 MoveSteps 走 1 圈 (6400 步 @ 2000 steps/s ≈ 3.2s),
+ * 期间每 100ms 采样一次编码器角度上报, 走完后打印起始/结束角度差,
+ * 用于验证: 电机机械转 1 圈 → 编码器读数回正 (回到起始角度).
+ * I2C 只读, 不参与闭环.
+ */
+static void DbgCmd_SpinUpdate(uint32_t now_ms)
+{
+    uint8_t e[48];
+    uint16_t w;
+    int l;
+
+    if (!spin_active) return;
+
+    /* 周期采样上报 */
+    if ((now_ms - spin_sample_next) >= 100u) {
+        spin_sample_next = now_ms;
+        spin_last_angle = MT6701_ReadDegrees(&enc_tilt);
+        l = snprintf((char *)e, sizeof(e), "SPIN a=%.1f\r\n", spin_last_angle);
+        if (l > 0) UART_Send(&uart_dbg, e, (uint16_t)l, &w);
+    }
+
+    /* 完成判定: 目标步数已清 (MoveSteps 到点自动停) 且启动超过 500ms */
+    if (stepper_tilt.target_steps == 0 &&
+        (now_ms - spin_t0) >= 500u) {
+        spin_active = 0;
+        spin_last_angle = MT6701_ReadDegrees(&enc_tilt);
+        l = snprintf((char *)e, sizeof(e),
+                     "SPIN-DONE start=%.1f end=%.1f\r\n",
+                     spin_start_angle, spin_last_angle);
+        if (l > 0) UART_Send(&uart_dbg, e, (uint16_t)l, &w);
     }
 }
 
