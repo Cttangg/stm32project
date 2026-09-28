@@ -62,6 +62,7 @@ void Axis_Init(Axis *axis,
     axis->in_position  = false;
     axis->state        = AXIS_DISABLED;
     axis->fault        = AXIS_OK;
+    axis->enc_fail_cnt = 0;
 }
 
 void Axis_Enable(Axis *axis)
@@ -140,11 +141,15 @@ void Axis_Update(Axis *axis, float dt)
     }
 
     if (MT6701_IsMagnetOK(axis->encoder) == 0) {
-        axis->fault = AXIS_ERR_ENCODER;      /* 磁铁异常 → 反馈不可靠 */
-        axis->state = AXIS_FAULT;
-        axis_stop_output(axis);
-        return;
+        /* I2C 偶发故障容忍: 连续失败超过阈值才判定编码器异常 (磁检失败/持续无应答) */
+        if (++axis->enc_fail_cnt >= 3) {
+            axis->fault = AXIS_ERR_ENCODER;
+            axis->state = AXIS_FAULT;
+            axis_stop_output(axis);
+        }
+        return;   /* 本次跳过更新, 保持上次输出 */
     }
+    axis->enc_fail_cnt = 0;
 
     angle = MT6701_ReadDegrees(axis->encoder);
     axis->position = angle;

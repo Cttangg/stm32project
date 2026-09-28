@@ -1,11 +1,12 @@
 /**
  ******************************************************************************
  * @file    motion.c
- * @brief   运动管理器实现 — 双轴目标协调
+ * @brief   运动管理器实现 — 位置限幅 + 双轴协调 + Safety 联动
  *
- * 双轴协调 (requirements.md §11):
- *   两轴同时启动 / 各自限速 / 各自限加速度 (由 Axis→PID 内部完成)
- *   Motion 不做跨轴轨迹规划, 仅统一目标入口.
+ * 链路 (Phase 3):
+ *   target → 位置限幅 → Axis_SetTarget(Pan/Tilt 同时)
+ *   速度/加速度限制由 Axis→PID 内部 max_speed/max_accel 承担 (参数未改)
+ *   Safety 不允许运动时 → Motion_Stop()
  ******************************************************************************
  */
 #include "motion.h"
@@ -13,6 +14,13 @@
 static MotionConfig   s_cfg;
 static GimbalSetpoint s_target;
 static bool           s_inited;
+
+static float clampf(float v, float lo, float hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
 
 void Motion_Init(const MotionConfig *cfg)
 {
@@ -26,12 +34,13 @@ void Motion_SetTarget(float pan, float tilt)
 {
     if (!s_inited) return;
 
-    s_target.pan  = pan;
-    s_target.tilt = tilt;
+    /* ── 位置限幅 (Phase 3.2) ── */
+    s_target.pan  = clampf(pan,  s_cfg.pan_min,  s_cfg.pan_max);
+    s_target.tilt = clampf(tilt, s_cfg.tilt_min, s_cfg.tilt_max);
 
-    /* 双轴同时下发目标, 各自由 Axis 内部限幅/限速/限加速度 */
-    if (s_cfg.pan)  Axis_SetTarget(s_cfg.pan, pan);
-    if (s_cfg.tilt) Axis_SetTarget(s_cfg.tilt, tilt);
+    /* ── 双轴同时下发目标, 各自由 Axis 内部限速/限加速度 ── */
+    if (s_cfg.pan)  Axis_SetTarget(s_cfg.pan,  s_target.pan);
+    if (s_cfg.tilt) Axis_SetTarget(s_cfg.tilt, s_target.tilt);
 }
 
 void Motion_Stop(void)
@@ -51,10 +60,25 @@ void Motion_Stop(void)
 
 void Motion_Update(float dt)
 {
-    (void)dt;   /* 目标已在 Motion_SetTarget 立即下发; 周期仅用于未来轨迹规划 */
+    (void)dt;
+
+    if (!s_inited) return;
+
+    /* ── Safety 联动 (Phase 3 验收 ⑦): 不允许运动 → 立即停止 ── */
+    if (!Safety_IsMotionAllowed()) {
+        Motion_Stop();
+    }
 }
 
 GimbalSetpoint Motion_GetSetpoint(void)
 {
     return s_target;
+}
+
+bool Motion_IsInPosition(void)
+{
+    if (!s_inited) return false;
+    if (s_cfg.pan && !Axis_IsInPosition(s_cfg.pan)) return false;
+    if (s_cfg.tilt && !Axis_IsInPosition(s_cfg.tilt)) return false;
+    return true;
 }

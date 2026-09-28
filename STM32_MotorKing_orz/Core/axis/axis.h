@@ -75,6 +75,7 @@ typedef struct
     bool in_position;
     AxisState state;
     AxisFault  fault;
+    uint8_t    enc_fail_cnt;   /* 编码器连续失败计数 (偶发容忍, 连续失败才 FAULT) */
 
     /* ── 底层依赖 (由应用层注入) ── */
     MotorPID               *pid;

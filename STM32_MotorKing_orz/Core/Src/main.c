@@ -30,10 +30,15 @@
 #include "axis.h"
 #include "safety.h"
 #include "motion.h"
+#include "app_boot_interface.h"
+#include <string.h>
+#include <stdio.h>
+/* Phase 4-8 (暂时注释, 后续按流水线解锁):
 #include "communication.h"
 #include "tracking_manager.h"
 #include "app.h"
 #include "telemetry.h"
+*/
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -94,14 +99,26 @@ static SafetyConfig safety_cfg;
 /* 运动管理器 */
 static MotionConfig motion_cfg;
 
-/* 追踪管理器 */
+/* Phase 4-8 (暂时注释):
 static TrackingConfig tracking_cfg;
-
-/* 应用状态机 */
 static AppConfig app_cfg;
-
-/* 遥测 */
 static uint32_t telemetry_tick;
+*/
+
+/* 调试命令 (Phase 3 验收驱动): go <pan> <tilt> / stop / swing <amp> */
+static UART_Frame  dbg_cmd_frame;
+static uint8_t     dbg_cmd_buf[32];
+static uint16_t    dbg_cmd_len;
+static char        dbg_last_cmd[33];   /* 诊断: 最近完整命令 */
+
+/* 摆动测试状态: 以启动时的位置为原点, 小幅摆动 ±amp 度 (双轴同幅) */
+static uint8_t  swing_active;
+static float    swing_amp;
+static float    swing_pan_origin;
+static float    swing_tilt_origin;
+static int      swing_dir;         /* +1 / -1 */
+static uint32_t swing_next_ms;
+static uint32_t swing_period_ms;   /* 每个方向停留时间 */
 
 /* USER CODE END PV */
 
@@ -117,7 +134,9 @@ static void MX_SPI1_Init(void);
 static void MX_TIM13_Init(void);
 static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len);
+static void DbgCmd_SwingUpdate(uint32_t now_ms);
+static float DbgCmd_ParseFloat(const char *s, char **end);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -136,7 +155,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  APP_SetVectorTable();   /* 必须为第一行: 重定向向量表到 App (0x08008000), 在 HAL_Init 之前 */
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -205,16 +224,20 @@ int main(void)
   UART_Open(&uart_dbg);
   UART_Open(&uart_cam);
 
-  /* 通信管理器: 摄像头视觉帧解析 → VisionTarget */
-  Communication_Init(&uart_cam);
+  /* 通信管理器: 摄像头视觉帧解析 → VisionTarget (Phase 4, 暂时注释)
+  Communication_Init(&uart_cam); */
 
   /* 单轴抽象: 包装 编码器 + PID + 步进引擎 + 驱动 */
   Axis_Init(&axis_tilt, &pid_tilt, &motor_tilt, &enc_tilt, &stepper_tilt);
   Axis_Init(&axis_pan,  &pid_pan,  &motor_pan,  &enc_pan,  &stepper_pan);
 
-  /* 限位 (默认 ±180°, 按实际机械行程修改; 控制参数保留 PID 默认值) */
-  Axis_SetLimits(&axis_tilt, -180.0f, 180.0f);
-  Axis_SetLimits(&axis_pan,  -180.0f, 180.0f);
+  /* 启动时目标 = 当前位置 (避免 PID 全速追默认 0° 导致乱转) */
+  Axis_SetTarget(&axis_tilt, MT6701_ReadDegrees(&enc_tilt));
+  Axis_SetTarget(&axis_pan,  MT6701_ReadDegrees(&enc_pan));
+
+  /* 限位: 编码器绝对角度 0-360°, 先用全范围避免误触发 (物理行程限位后按机械标定) */
+  Axis_SetLimits(&axis_tilt, 0.0f, 360.0f);
+  Axis_SetLimits(&axis_pan,  0.0f, 360.0f);
 
   Axis_Enable(&axis_tilt);
   Axis_Enable(&axis_pan);
@@ -225,33 +248,40 @@ int main(void)
   safety_cfg.enable_key_pause = true;
   Safety_Init(&safety_cfg);
 
-  /* 运动: 绑定 Pan/Tilt 轴 */
+  /* 运动: 绑定 Pan/Tilt 轴 + 角度限位 (编码器坐标 0-360, 物理行程标定后收紧) */
   motion_cfg.pan = &axis_pan;
   motion_cfg.tilt = &axis_tilt;
+  motion_cfg.pan_min  = 0.0f;
+  motion_cfg.pan_max  = 360.0f;
+  motion_cfg.tilt_min = 0.0f;
+  motion_cfg.tilt_max = 360.0f;
   Motion_Init(&motion_cfg);
 
-  /* 追踪: 像素→角度系数/死区/滤波/超时 (默认值, 按实际相机标定修改) */
-  tracking_cfg.center_x         = 320.0f;
-  tracking_cfg.center_y         = 240.0f;
-  tracking_cfg.pixel_to_angle_x = 0.05f;   /* deg/px, 占位 */
-  tracking_cfg.pixel_to_angle_y = 0.05f;   /* deg/px, 占位 */
-  tracking_cfg.deadband_x       = 8.0f;    /* px */
-  tracking_cfg.deadband_y       = 8.0f;    /* px */
-  tracking_cfg.filter_alpha     = 0.4f;
-  tracking_cfg.vision_timeout_ms = 200;    /* 200ms 未更新 → LOST */
-  tracking_cfg.acquire_frames   = 5;       /* 连续 5 帧进入 TRACK */
-  Tracking_Init(&tracking_cfg, &motion_cfg);
-  Tracking_SetEnabled(false);              /* 默认关闭, 由 App 状态机控制 */
+  /* 调试命令 (Phase 3 验收): go <pan> <tilt> / stop / swing <amp> */
+  dbg_cmd_frame.header_len = 0;              /* 逐字节回调 */
+  dbg_cmd_frame.max_len    = sizeof(dbg_cmd_buf);
+  dbg_cmd_frame.get_length = NULL;
+  dbg_cmd_frame.check      = NULL;
+  dbg_cmd_frame.callback   = DbgCmd_OnByte;
+  dbg_cmd_frame.timeout_ms = 0;
+  dbg_cmd_len = 0;
+  UART_RegisterFrame(&uart_dbg, &dbg_cmd_frame);
 
-  /* 应用状态机: 绑定安全/运动, 初始 IDLE */
-  app_cfg.safety = &safety_cfg;
-  app_cfg.motion = &motion_cfg;
-  app_cfg.search_pan_deg = 0.0f;
-  App_Init(&app_cfg);
+  /* 摆动测试初始关闭 */
+  swing_active     = 0;
+  swing_amp        = 5.0f;                   /* 默认 ±5° */
+  swing_pan_origin = 0.0f;
+  swing_tilt_origin = 0.0f;
+  swing_dir        = 1;
+  swing_next_ms    = 0;
+  swing_period_ms  = 1000;                   /* 每方向 1s */
 
-  /* 遥测 */
-  Telemetry_Init(&axis_pan, &axis_tilt);
-  telemetry_tick = 0;
+  /* 上电自检标志: 验证 App 是否正常启动 (诊断用) */
+  {
+      static const uint8_t ready[] = "APP-READY\r\n";
+      uint16_t w = 0;
+      UART_Send(&uart_dbg, ready, sizeof(ready) - 1, &w);
+  }
 
   /* USER CODE END 2 */
 
@@ -262,10 +292,8 @@ int main(void)
     /* 串口帧解析/回调 (必须周期调用) */
     UART_Task(&uart_dbg);
 
-    /* 通信管理器: 摄像头帧解析 + 视觉超时维护 */
+    /* Phase 4-8 (暂时注释):
     Communication_Update(HAL_GetTick());
-
-    /* 追踪管理器: 消费视觉目标 → 输出云台 setpoint (先消费再更新) */
     {
         VisionTarget vt;
         if (Communication_PopVisionTarget(&vt)) {
@@ -273,11 +301,7 @@ int main(void)
         }
     }
     Tracking_Update(HAL_GetTick());
-
-    /* 应用状态机: 协调 Tracking/Motion/Safety */
     App_Update(HAL_GetTick());
-
-    /* 遥测: 50Hz 采样 (只读, 不参与控制) */
     {
         uint32_t now = HAL_GetTick();
         if ((now - telemetry_tick) >= 20) {
@@ -285,9 +309,13 @@ int main(void)
             Telemetry_Sample(now);
         }
     }
+    */
+
+    /* 运动: Safety 检查 + 目标下发 (Phase 3) */
+    DbgCmd_SwingUpdate(HAL_GetTick());
+    Motion_Update(0.005f);
 
     /* 单轴闭环 5ms 周期 (Axis 内部: 编码器 → PID → 步进驱动) */
-    Motion_Update(0.005f);
     Axis_Update(&axis_tilt, 0.005f);
     Axis_Update(&axis_pan,  0.005f);
 
@@ -721,6 +749,172 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+ * @brief 调试命令逐字节回调 (Phase 3 验收驱动)
+ *
+ * 命令格式 (USART1 调试口, 以 \r 或 \n 结尾):
+ *   go <pan> <tilt>  → 双轴运动到指定角度 (自动限幅)
+ *   stop             → 停止双轴 (保持当前位置)
+ *   swing <amp>      → 以当前位置为原点, 双轴小幅摆动 ±amp 度
+ *   swing stop       → 停止摆动, 回原点
+ *   boot             → 跳回 Bootloader (等主机烧录)
+ *   pos              → 打印当前 Pan/Tilt 位置
+ *   例: "go 40 20\r"  "swing 5\r"  "swing stop\r"  "stop\r"  "boot\r"  "pos\r"
+ */
+static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
+{
+    float pan, tilt, amp;
+    char cmd[33];
+    char *endp;
+    (void)dev;
+
+    for (uint16_t i = 0; i < len; i++) {
+        uint8_t b = data[i];
+        if (b == '\r' || b == '\n') {
+            if (dbg_cmd_len > 0) {
+                dbg_cmd_buf[dbg_cmd_len] = '\0';
+                cmd[0] = '\0';
+                strncpy(dbg_last_cmd, (char *)dbg_cmd_buf, sizeof(dbg_last_cmd) - 1);
+                dbg_last_cmd[sizeof(dbg_last_cmd) - 1] = '\0';
+                if (sscanf((char *)dbg_cmd_buf, "%31s", cmd) == 1) {
+                    if (strcmp(cmd, "go") == 0) {
+                        /* 手动解析浮点 (nano 库 strtof/scanf %f 不可靠) */
+                        endp = NULL;
+                        pan  = DbgCmd_ParseFloat((char *)dbg_cmd_buf + 3, &endp);
+                        if (endp) {
+                            tilt = DbgCmd_ParseFloat(endp, &endp);
+                            if (endp) {
+                                swing_active = 0;          /* 手动目标覆盖摆动 */
+                                Motion_SetTarget(pan, tilt);
+                                { uint8_t e[48]; int l = snprintf((char*)e, sizeof(e), "GO->%.1f %.1f\r\n", pan, tilt); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                            } else {
+                                { uint8_t e[]="GO-TILT-FAIL\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                            }
+                        } else {
+                            { uint8_t e[]="GO-PAN-FAIL\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                        }
+                    } else if (strcmp(cmd, "stop") == 0) {
+                        swing_active = 0;
+                        Motion_Stop();
+                    } else if (strcmp(cmd, "swing") == 0) {
+                        /* strtof 解析 amp */
+                        endp = NULL;
+                        amp  = DbgCmd_ParseFloat((char *)dbg_cmd_buf + 6, &endp);
+                        if (endp) {
+                            /* 启动摆动: 以当前位置为原点 */
+                            swing_active      = 1;
+                            swing_amp         = (amp < 1.0f) ? 1.0f : amp;
+                            swing_pan_origin  = Axis_GetPosition(&axis_pan);
+                            swing_tilt_origin = Axis_GetPosition(&axis_tilt);
+                            swing_dir         = 1;
+                            swing_next_ms     = HAL_GetTick() + swing_period_ms;
+                            Motion_SetTarget(swing_pan_origin + swing_dir * swing_amp,
+                                             swing_tilt_origin + swing_dir * swing_amp);
+                        } else {
+                            swing_active = 0;          /* "swing stop" */
+                            Motion_SetTarget(swing_pan_origin, swing_tilt_origin);
+                        }
+                    } else if (strcmp(cmd, "boot") == 0) {
+                        /* 跳回 Bootloader 等待主机烧录 */
+                        APP_JumpToBootloader();
+                    } else if (strcmp(cmd, "pos") == 0) {
+                        /* 打印当前 Pan/Tilt 位置 (调试口) */
+                        {
+                            uint8_t tmp[64];
+                            int len = snprintf((char *)tmp, sizeof(tmp),
+                                               "PAN=%.2f TILT=%.2f\r\n",
+                                               Axis_GetPosition(&axis_pan),
+                                               Axis_GetPosition(&axis_tilt));
+                            uint16_t w = 0;
+                            if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
+                        }
+                    } else if (strcmp(cmd, "echo") == 0) {
+                        /* 回显最近收到的命令 (诊断) */
+                        {
+                            uint8_t tmp[48];
+                            int len = snprintf((char *)tmp, sizeof(tmp),
+                                               "LAST[%s]\r\n", dbg_last_cmd);
+                            uint16_t w = 0;
+                            if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
+                        }
+                    } else if (strcmp(cmd, "stat") == 0) {
+                        /* 打印轴状态/故障/编码器 + I2C1 器件探测 (诊断) */
+                        {
+                            uint8_t tmp[160];
+                            float tilt_angle = -1.0f;
+                            uint16_t tilt_raw = MT6701_ReadRaw(&enc_tilt);
+                            HAL_StatusTypeDef i2c1_ready = HAL_I2C_IsDeviceReady(&hi2c1, 0x0C, 3, 10);
+                            if (tilt_raw != 0) tilt_angle = (float)tilt_raw * MT6701_LSB_DEG;
+                            int len = snprintf((char *)tmp, sizeof(tmp),
+                                               "P:tgt=%.1f vr=%.0f st=%d flt=%d | T:st=%d flt=%d raw=%u i2c1=%d\r\n",
+                                               pid_pan.target,
+                                               pid_pan.vel_ref,
+                                               (int)Axis_GetState(&axis_pan),
+                                               (int)axis_pan.fault,
+                                               (int)Axis_GetState(&axis_tilt),
+                                               (int)axis_tilt.fault,
+                                               (unsigned)tilt_raw,
+                                               (int)i2c1_ready);
+                            uint16_t w = 0;
+                            if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
+                        }
+                    }
+                }
+                dbg_cmd_len = 0;
+            }
+        } else if (dbg_cmd_len < sizeof(dbg_cmd_buf) - 1) {
+            dbg_cmd_buf[dbg_cmd_len++] = b;
+        }
+    }
+}
+
+/**
+ * @brief 手动浮点解析 (兼容 nano.specs, 不依赖 strtof/scanf %f)
+ * @param s  起始指针 (跳过前导空白)
+ * @param end 输出: 解析结束位置 (NULL = 无有效数字)
+ * @return 解析值
+ */
+static float DbgCmd_ParseFloat(const char *s, char **end)
+{
+    float sign = 1.0f, ipart = 0.0f, fpart = 0.0f, fdiv = 1.0f;
+    const char *p = s;
+    int found = 0;
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '-') { sign = -1.0f; p++; }
+    else if (*p == '+') { p++; }
+
+    while (*p >= '0' && *p <= '9') { ipart = ipart * 10.0f + (*p - '0'); p++; found = 1; }
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') { fdiv *= 10.0f; fpart = fpart * 10.0f + (*p - '0'); p++; found = 1; }
+    }
+
+    if (end) {
+        *end = found ? (char *)p : NULL;
+    }
+    return sign * (ipart + fpart / fdiv);
+}
+
+/**
+ * @brief 摆动测试周期驱动 (主循环调用): 按周期切换方向
+ *
+ * 以启动时的位置为原点, Pan/Tilt 同幅摆动 ±swing_amp,
+ * 用于验证: 双轴同步运动、限位、编码器反馈、I2C 总线自愈 (偶发故障下不丢步).
+ */
+static void DbgCmd_SwingUpdate(uint32_t now_ms)
+{
+    if (!swing_active) return;
+
+    if ((now_ms - swing_next_ms) < 0x7FFFFFFFu &&
+        now_ms >= swing_next_ms) {
+        swing_dir = -swing_dir;
+        swing_next_ms = now_ms + swing_period_ms;
+        Motion_SetTarget(swing_pan_origin + swing_dir * swing_amp,
+                         swing_tilt_origin + swing_dir * swing_amp);
+    }
+}
 
 /* USER CODE END 4 */
 

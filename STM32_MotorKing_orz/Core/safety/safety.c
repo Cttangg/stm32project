@@ -73,10 +73,11 @@ void Safety_Update(uint32_t now_ms)
 {
     uint8_t pause, reset;
 
-    /* 1. 轴故障 (编码器/限位) → FAULT, 最高优先级 */
-    if (Axis_IsFault(s_cfg.pan) || Axis_IsFault(s_cfg.tilt)) {
+    /* 1. 轴故障: 故障轴已自行停止输出 (Axis 内部 FAULT 停)。
+          不冻结另一轴: 单轴故障只隔离该轴, 便于诊断与另一轴继续运动。
+          急停 (按键) 才全局禁止运动。 */
+    if (Axis_IsFault(s_cfg.pan) && Axis_IsFault(s_cfg.tilt)) {
         s_level = SAFETY_FAULT;
-        /* 不重复调 EmergencyStop: Axis 已停止输出 */
         return;
     }
 
