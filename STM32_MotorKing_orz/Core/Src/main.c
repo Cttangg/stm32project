@@ -167,7 +167,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  APP_SetVectorTable();   /* 必须为第一行: 重定向向量表到 App (0x08008000), 在 HAL_Init 之前 */
+  SCB->VTOR = 0x08000000U;   /* 直烧模式: 向量表在 Flash 头部 (无 BL) */
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
