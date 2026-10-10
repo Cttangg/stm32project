@@ -54,12 +54,16 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/axis/axis.c
     Core/safety/safety.c
     Core/motion/motion.c
-    # Phase 4-8 (暂时注释, 后续按流水线解锁):
-    # Core/communication/communication.c
-    # Core/tracking/coordinate_transform.c
-    # Core/tracking/tracking_manager.c
-    # Core/app/app.c
-    # Core/telemetry/telemetry.c
+    Core/communication/communication.c
+    Core/tracking/coordinate_transform.c
+    Core/tracking/tracking_manager.c
+    Core/app/target_source.c
+    Core/app/gimbal_points.c
+    Core/app/calib.c
+    Core/app/q12.c
+    Core/app/pause.c
+    Core/app/app.c
+    Core/telemetry/telemetry.c
 )
 
 # Add include paths
@@ -69,11 +73,10 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Core/axis
     Core/safety
     Core/motion
-    # Phase 4-8 include (暂时注释):
-    # Core/communication
-    # Core/tracking
-    # Core/app
-    # Core/telemetry
+    Core/communication
+    Core/tracking
+    Core/app
+    Core/telemetry
 )
 
 # Add project symbols (macros)

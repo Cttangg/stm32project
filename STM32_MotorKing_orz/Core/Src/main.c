@@ -30,6 +30,11 @@
 #include "axis.h"
 #include "safety.h"
 #include "motion.h"
+#include "target_source.h"
+#include "gimbal_points.h"
+#include "calib.h"
+#include "q12.h"
+#include "pause.h"
 #include "app_boot_interface.h"
 #include <string.h>
 #include <stdio.h>
@@ -99,6 +104,15 @@ static SafetyConfig safety_cfg;
 /* 运动管理器 */
 static MotionConfig motion_cfg;
 
+/* 标定流程 (KEY_CALIB) */
+static CalibConfig calib_cfg;
+
+/* Q1/Q2 序列 (KEY_RESET / KEY_BORDER) */
+static Q12Config q12_cfg;
+
+/* 暂停/继续 (KEY_PAUSE) */
+static PauseConfig pause_cfg;
+
 /* Phase 4-8 (暂时注释):
 static TrackingConfig tracking_cfg;
 static AppConfig app_cfg;
@@ -126,11 +140,6 @@ static float    spin_last_angle;
 static uint32_t spin_t0;
 static uint32_t spin_sample_next;
 
-/* 编码器失效保护: 连续读失败计数 (裸 PID 模式, 超阈值停轴防空转) */
-static uint8_t  enc_fail_pan;
-static uint8_t  enc_fail_tilt;
-#define ENC_FAIL_LIMIT  5   /* 连续 5 次失败 → 停轴 */
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -149,6 +158,8 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len);
 static void DbgCmd_SwingUpdate(uint32_t now_ms);
 static void DbgCmd_SpinUpdate(uint32_t now_ms);
 static float DbgCmd_ParseFloat(const char *s, char **end);
+static const char *DbgCmd_Token(const char *s, int idx);
+static MotorPID *DbgCmd_Axis(const char *s);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -229,10 +240,9 @@ int main(void)
   /* 位置闭环 PID (默认 1/32 细分标定) */
   MotorPID_Init(&pid_tilt);
   MotorPID_Init(&pid_pan);
-  /* Pan PID 整定 (实测 2026-09-29): kp=700 ki=100 kd=350
-     正向过冲 0.17°, 无高频抖动, 精确锁定 ±0.04°
-     (默认 kp=1500/kd=125 会导致 Pan 目标附近极限环振荡 ±2.5°) */
-  MotorPID_SetGains(&pid_pan, 700.0f, 100.0f, 350.0f);
+  /* Pan(X) 实测整定: gains 350/30/0, 限速 7200/36000 (~405°/s) */
+  MotorPID_SetGains(&pid_pan, 350.0f, 30.0f, 0.0f);
+  MotorPID_SetSpeedLimit(&pid_pan, 7200.0f, 36000.0f);
 
   /* 串口库: USART1 调试口 + USART2 摄像头 (RX DMA 需为 Circular) */
   UART_Init(&uart_dbg, &huart1);
@@ -243,8 +253,8 @@ int main(void)
   /* 通信管理器: 摄像头视觉帧解析 → VisionTarget (Phase 4, 暂时注释)
   Communication_Init(&uart_cam); */
 
-  /* 单轴抽象: 包装 编码器 + PID + 步进引擎 + 驱动
-     (裸 PID 测试模式: 仅电机1/Tilt 使能, 电机2/Pan 保持禁用) */
+  /* 单轴抽象: 包装 编码器 + PID + 步进引擎 + 驱动 (双轴使能, 内环闭环经 Axis 编排,
+     方向符号统一由 Axis 层 dir_sign 补偿) */
   Axis_Init(&axis_tilt, &pid_tilt, &motor_tilt, &enc_tilt, &stepper_tilt);
   Axis_Init(&axis_pan,  &pid_pan,  &motor_pan,  &enc_pan,  &stepper_pan);
 
@@ -259,14 +269,14 @@ int main(void)
   Axis_Enable(&axis_tilt);
   Axis_Enable(&axis_pan);
 
-  /* 裸 PID 模式: 用 MotorPID_SetTarget 使能双轴 PID, 目标 = 当前位置 */
+  /* 使能双轴 PID, 目标 = 当前位置 (Axis_Update 首帧也会兜底使能) */
   MotorPID_SetTarget(&pid_tilt, MT6701_ReadDegrees(&enc_tilt));
   MotorPID_SetTarget(&pid_pan,  MT6701_ReadDegrees(&enc_pan));
 
-  /* 安全: 绑定轴, 使能按键暂停 */
+  /* 安全: 绑定轴 (按键暂停改由 Pause 模块处理: 制动+恢复) */
   safety_cfg.pan = &axis_pan;
   safety_cfg.tilt = &axis_tilt;
-  safety_cfg.enable_key_pause = true;
+  safety_cfg.enable_key_pause = false;
   Safety_Init(&safety_cfg);
 
   /* 运动: 绑定 Pan/Tilt 轴 + 角度限位 (编码器坐标 0-360, 物理行程标定后收紧) */
@@ -277,6 +287,35 @@ int main(void)
   motion_cfg.tilt_min = 0.0f;
   motion_cfg.tilt_max = 360.0f;
   Motion_Init(&motion_cfg);
+
+  /* 数据源注册 (仅注册, 不激活):
+     direct = Q1/Q2 电机角度直接闭环; vision = Q3 视觉外环
+     (vision 只有激活时才注册摄像头帧, 故此处 USART2 保持空闲) */
+  TargetSource_VisionBind(&uart_cam);
+  TargetSource_Init();
+
+  /* Q1/Q2 标定点 (O/左上/右上/右下/左下), 初值清零 */
+  GimbalPoints_Init();
+
+  /* 标定流程: 绑定两轴 + 编码器 (按 CALIB 先释放电机, 手动摆点逐点记录) */
+  calib_cfg.pan      = &axis_pan;
+  calib_cfg.tilt     = &axis_tilt;
+  calib_cfg.enc_pan  = &enc_pan;
+  calib_cfg.enc_tilt = &enc_tilt;
+  calib_cfg.uart     = &uart_dbg;
+  Calib_Init(&calib_cfg);
+
+  /* Q1/Q2 序列: RST 回 O, BORDER 左上起顺时针一圈回 O */
+  q12_cfg.pan              = &axis_pan;
+  q12_cfg.tilt             = &axis_tilt;
+  q12_cfg.uart             = &uart_dbg;
+  q12_cfg.settle_ms        = 150u;    /* 到位后稳定 150ms 再推进 */
+  q12_cfg.point_timeout_ms = 6000u;   /* 单点超时 (顺时针一圈 30s 内) */
+  Q12_Init(&q12_cfg);
+
+  /* 暂停/继续: KEY_PAUSE 立即制动, 再按恢复 */
+  pause_cfg.uart = &uart_dbg;
+  Pause_Init(&pause_cfg);
 
   /* 调试命令 (Phase 3 验收): go <pan> <tilt> / stop / swing <amp> */
   dbg_cmd_frame.header_len = 0;              /* 逐字节回调 */
@@ -295,10 +334,6 @@ int main(void)
   swing_dir        = 1;
   swing_next_ms    = 0;
   swing_period_ms  = 1000;                   /* 每方向 1s */
-
-  /* 编码器失效保护计数清零 */
-  enc_fail_pan  = 0;
-  enc_fail_tilt = 0;
 
   /* 开环走圈测试初始关闭 */
   spin_active      = 0;
@@ -342,43 +377,27 @@ int main(void)
     }
     */
 
-    /* ── PID 闭环测试模式: 双轴裸 PID (编码器失效保护) ── */
-    DbgCmd_SwingUpdate(HAL_GetTick());   /* 摆动目标直接喂 PID (Tilt 单轴) */
+    /* ── 位置闭环 5ms: 编码器 → MotorPID → MotorStepper (统一经 Axis 编排) ── */
+    DbgCmd_SwingUpdate(HAL_GetTick());   /* 摆动目标经 Axis_SetTarget (Tilt 单轴) */
     DbgCmd_SpinUpdate(HAL_GetTick());    /* 开环走圈 (与 PID 互斥, 由命令控制) */
 
-    /* 位置闭环 5ms: 编码器 → MotorPID → MotorStepper (双轴裸 PID)
-       spin 开环走圈期间暂停 PID, 避免 MoveSteps 与 SetVelocity 冲突
-       编码器读失败 (0xFFFF 哨兵) 连续 ENC_FAIL_LIMIT 次 → 停轴, 防堵转/空转 */
+    /* spin 开环走圈期间暂停 Axis, 避免 MoveSteps 与 SetVelocity 冲突;
+       Axis_Update 内部: 读编码器(含 0xFFFF 哨兵/磁检) → 限位 → MotorPID → 方向符号 → 步进 */
     if (!spin_active) {
-        float t_ang = MT6701_ReadDegrees(&enc_tilt);
-        float p_ang = MT6701_ReadDegrees(&enc_pan);
-
-        /* Tilt: 读失败则计数, 超阈值停轴 */
-        if (t_ang > 360.0f) {
-            if (++enc_fail_tilt >= ENC_FAIL_LIMIT) {
-                MotorStepper_SetVelocity(&stepper_tilt, 0.0f);
-            }
-        } else {
-            enc_fail_tilt = 0;
-            MotorPID_Update(&pid_tilt, t_ang, 0.005f);
-            MotorStepper_SetVelocity(&stepper_tilt, -pid_tilt.vel_ref);
-        }
-
-        /* Pan: 同上 */
-        if (p_ang > 360.0f) {
-            if (++enc_fail_pan >= ENC_FAIL_LIMIT) {
-                MotorStepper_SetVelocity(&stepper_pan, 0.0f);
-            }
-        } else {
-            enc_fail_pan = 0;
-            MotorPID_Update(&pid_pan, p_ang, 0.005f);
-            MotorStepper_SetVelocity(&stepper_pan, -pid_pan.vel_ref);
-        }
+        Axis_Update(&axis_tilt, 0.005f);
+        Axis_Update(&axis_pan,  0.005f);
     } else {
         MT6701_ReadDegrees(&enc_tilt);   /* spin 期间 I2C 只读 */
     }
 
-    /* 电机2/Pan: 不调用任何 Update (驱动已 Disable) */
+    /* KEY_CALIB 标定: 第1按释放电机, 之后逐点记录 O→左上→右上→右下→左下 */
+    Calib_Update(HAL_GetTick());
+
+    /* 暂停/继续 (KEY_PAUSE): 先于 Q12 处理, 立即制动 */
+    Pause_Update(HAL_GetTick());
+
+    /* Q1/Q2 序列: KEY_RESET 回 O / KEY_BORDER 顺时针绕边一圈 */
+    Q12_Update(HAL_GetTick());
 
     /* 安全监控: 按键/轴故障/限位 (故障时阻止运动) */
     Safety_Update(HAL_GetTick());
@@ -849,8 +868,7 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                             tilt = DbgCmd_ParseFloat(endp, &endp);
                             if (endp) {
                                 swing_active = 0;              /* 手动目标覆盖摆动 */
-                                MotorPID_SetTarget(&pid_pan,  pan);
-                                MotorPID_SetTarget(&pid_tilt, tilt);
+                                Motion_SetTarget(pan, tilt);   /* 经 Motion 限幅 → Axis */
                                 { uint8_t e[48]; int l = snprintf((char*)e, sizeof(e), "GO->PAN %.1f TILT %.1f\r\n", pan, tilt); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
                             } else {
                                 { uint8_t e[]="GO-TILT-FAIL\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
@@ -860,10 +878,7 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                         }
                     } else if (strcmp(cmd, "stop") == 0) {
                         swing_active = 0;
-                        MotorPID_SetTarget(&pid_pan,  MT6701_ReadDegrees(&enc_pan));
-                        MotorPID_SetTarget(&pid_tilt, MT6701_ReadDegrees(&enc_tilt));
-                        MotorStepper_SetVelocity(&stepper_pan,  0.0f);
-                        MotorStepper_SetVelocity(&stepper_tilt, 0.0f);
+                        Motion_Stop();                 /* 目标=当前位置, Axis 保持不动 */
                     } else if (strcmp(cmd, "pid") == 0) {
                         /* 在线调整 Pan PID: pid <kp> <ki> <kd> (作用于 Pan 轴) */
                         {
@@ -881,6 +896,85 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                                 { uint8_t e[]="PID-FMT: pid <kp> <ki> <kd>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
                             }
                         }
+                    } else if (strcmp(cmd, "gains") == 0) {
+                        /* gains <x|y> <kp> <ki> <kd>: 在线调增益 */
+                        MotorPID *mp = DbgCmd_Axis(DbgCmd_Token((char *)dbg_cmd_buf, 1));
+                        const char *p = DbgCmd_Token((char *)dbg_cmd_buf, 2);
+                        float kp = 0, ki = 0, kd = 0;
+                        endp = NULL;
+                        if (mp && p) {
+                            kp = DbgCmd_ParseFloat(p, &endp);
+                            if (endp) ki = DbgCmd_ParseFloat(endp, &endp);
+                            if (endp) kd = DbgCmd_ParseFloat(endp, &endp);
+                        }
+                        if (mp && endp && kp >= 0 && ki >= 0 && kd >= 0) {
+                            MotorPID_SetGains(mp, kp, ki, kd);
+                            { uint8_t e[48]; int l = snprintf((char*)e, sizeof(e), "GAINS kp=%.0f ki=%.0f kd=%.0f\r\n", kp, ki, kd); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                        } else {
+                            { uint8_t e[]="GAINS-FMT: gains <x|y> <kp> <ki> <kd>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                        }
+                    } else if (strcmp(cmd, "limit") == 0) {
+                        /* limit <x|y> <max_speed> <max_accel>: 在线调速度/加速度上限 */
+                        MotorPID *mp = DbgCmd_Axis(DbgCmd_Token((char *)dbg_cmd_buf, 1));
+                        const char *p = DbgCmd_Token((char *)dbg_cmd_buf, 2);
+                        float v = 0, a = 0;
+                        endp = NULL;
+                        if (mp && p) {
+                            v = DbgCmd_ParseFloat(p, &endp);
+                            if (endp) a = DbgCmd_ParseFloat(endp, &endp);
+                        }
+                        if (mp && endp && v > 0 && a > 0) {
+                            MotorPID_SetSpeedLimit(mp, v, a);
+                            { uint8_t e[52]; int l = snprintf((char*)e, sizeof(e), "LIMIT v=%.0f a=%.0f\r\n", v, a); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                        } else {
+                            { uint8_t e[]="LIMIT-FMT: limit <x|y> <max_speed> <max_accel>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                        }
+                    } else if (strcmp(cmd, "dead") == 0) {
+                        /* dead <x|y> <enter> <exit> <comp_max> <stiction> */
+                        MotorPID *mp = DbgCmd_Axis(DbgCmd_Token((char *)dbg_cmd_buf, 1));
+                        const char *p = DbgCmd_Token((char *)dbg_cmd_buf, 2);
+                        float en = 0, ex = 0, cm = 0, st = 0;
+                        endp = NULL;
+                        if (mp && p) {
+                            en = DbgCmd_ParseFloat(p, &endp);
+                            if (endp) ex = DbgCmd_ParseFloat(endp, &endp);
+                            if (endp) cm = DbgCmd_ParseFloat(endp, &endp);
+                            if (endp) st = DbgCmd_ParseFloat(endp, &endp);
+                        }
+                        if (mp && endp) {
+                            MotorPID_SetDeadband(mp, en, ex, cm, st);
+                            { uint8_t e[64]; int l = snprintf((char*)e, sizeof(e), "DEAD in=%.2f out=%.2f comp=%.2f stic=%.0f\r\n", en, ex, cm, st); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                        } else {
+                            { uint8_t e[]="DEAD-FMT: dead <x|y> <enter> <exit> <comp_max> <stiction>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                        }
+                    } else if (strcmp(cmd, "lp") == 0) {
+                        /* lp <x|y> <d_alpha>: D 项低通系数 (0~1) */
+                        MotorPID *mp = DbgCmd_Axis(DbgCmd_Token((char *)dbg_cmd_buf, 1));
+                        const char *p = DbgCmd_Token((char *)dbg_cmd_buf, 2);
+                        float al = 0;
+                        endp = NULL;
+                        if (mp && p) al = DbgCmd_ParseFloat(p, &endp);
+                        if (mp && endp) {
+                            MotorPID_SetDFilter(mp, al);
+                            { uint8_t e[40]; int l = snprintf((char*)e, sizeof(e), "LP alpha=%.2f\r\n", al); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                        } else {
+                            { uint8_t e[]="LP-FMT: lp <x|y> <d_alpha>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                        }
+                    } else if (strcmp(cmd, "params") == 0) {
+                        /* params <x|y>: 回读该轴全部可调参数 */
+                        MotorPID *mp = DbgCmd_Axis(DbgCmd_Token((char *)dbg_cmd_buf, 1));
+                        if (mp) {
+                            uint8_t tmp[180];
+                            int len = snprintf((char *)tmp, sizeof(tmp),
+                                "kp=%.0f ki=%.0f kd=%.0f lp=%.2f | vmax=%.0f amax=%.0f\r\n"
+                                "  dead in=%.2f out=%.2f comp=%.2f stic=%.0f\r\n",
+                                mp->kp, mp->ki, mp->kd, mp->d_alpha, mp->max_speed, mp->max_accel,
+                                mp->deadband_enter, mp->deadband_exit, mp->comp_max_err, mp->stiction_comp);
+                            uint16_t w = 0;
+                            if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
+                        } else {
+                            { uint8_t e[]="PARAMS-FMT: params <x|y>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                        }
                     } else if (strcmp(cmd, "swing") == 0) {
                         /* 手动解析 amp */
                         endp = NULL;
@@ -892,11 +986,11 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                             swing_tilt_origin = MT6701_ReadDegrees(&enc_tilt);
                             swing_dir         = 1;
                             swing_next_ms     = HAL_GetTick() + swing_period_ms;
-                            MotorPID_SetTarget(&pid_tilt,
-                                               swing_tilt_origin + swing_dir * swing_amp);
+                            Axis_SetTarget(&axis_tilt,
+                                           swing_tilt_origin + swing_dir * swing_amp);
                         } else {
                             swing_active = 0;          /* "swing stop" */
-                            MotorPID_SetTarget(&pid_tilt, swing_tilt_origin);
+                            Axis_SetTarget(&axis_tilt, swing_tilt_origin);
                         }
                     } else if (strcmp(cmd, "spin") == 0) {
                         /* 开环走 1 整圈 (6400 步 @ 2000 steps/s ≈ 3.2s), I2C 周期采样验证回正 */
@@ -970,6 +1064,52 @@ static void DbgCmd_OnByte(UART_Device *dev, uint8_t *data, uint16_t len)
                             uint16_t w = 0;
                             if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
                         }
+                    } else if (strcmp(cmd, "pts") == 0) {
+                        /* 打印 5 个标定点: O / 左上 / 右上 / 右下 / 左下 (*=已标定) */
+                        {
+                            const GimbalPoint *p = GimbalPoints_All();
+                            uint8_t tmp[200];
+                            int len = snprintf((char *)tmp, sizeof(tmp),
+                                "O%s%.1f,%.1f LU%s%.1f,%.1f RU%s%.1f,%.1f RD%s%.1f,%.1f LD%s%.1f,%.1f\r\n",
+                                p[GP_ORIGIN].valid ? "*" : "", p[GP_ORIGIN].pan_deg, p[GP_ORIGIN].tilt_deg,
+                                p[GP_LEFT_UP].valid ? "*" : "", p[GP_LEFT_UP].pan_deg, p[GP_LEFT_UP].tilt_deg,
+                                p[GP_RIGHT_UP].valid ? "*" : "", p[GP_RIGHT_UP].pan_deg, p[GP_RIGHT_UP].tilt_deg,
+                                p[GP_RIGHT_DOWN].valid ? "*" : "", p[GP_RIGHT_DOWN].pan_deg, p[GP_RIGHT_DOWN].tilt_deg,
+                                p[GP_LEFT_DOWN].valid ? "*" : "", p[GP_LEFT_DOWN].pan_deg, p[GP_LEFT_DOWN].tilt_deg);
+                            uint16_t w = 0;
+                            if (len > 0) UART_Send(&uart_dbg, tmp, (uint16_t)len, &w);
+                        }
+                    } else if (strcmp(cmd, "cal") == 0) {
+                        /* cal <id>: 记录当前角度到标定点 (0=O 1=LU 2=RU 3=RD 4=LD) */
+                        {
+                            float id;
+                            endp = NULL;
+                            id = DbgCmd_ParseFloat((char *)dbg_cmd_buf + 3, &endp);
+                            if (endp && id >= 0.0f && id < (float)GP_COUNT) {
+                                GimbalPoints_Record((GimbalPointId)(int)id,
+                                                    Axis_GetPosition(&axis_pan),
+                                                    Axis_GetPosition(&axis_tilt));
+                                { uint8_t e[40]; int l = snprintf((char*)e, sizeof(e), "CAL pt=%d\r\n", (int)id); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                            } else {
+                                { uint8_t e[]="CAL-FMT: cal <0..4>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                            }
+                        }
+                    } else if (strcmp(cmd, "goto") == 0) {
+                        /* goto <id>: 运动到已标定点 (0=O 1=LU 2=RU 3=RD 4=LD) */
+                        {
+                            float id;
+                            GimbalPoint gp;
+                            endp = NULL;
+                            id = DbgCmd_ParseFloat((char *)dbg_cmd_buf + 4, &endp);
+                            if (endp && id >= 0.0f && id < (float)GP_COUNT &&
+                                GimbalPoints_Get((GimbalPointId)(int)id, &gp) && gp.valid) {
+                                swing_active = 0;
+                                Motion_SetTarget(gp.pan_deg, gp.tilt_deg);
+                                { uint8_t e[48]; int l = snprintf((char*)e, sizeof(e), "GOTO pt=%d ->%.1f,%.1f\r\n", (int)id, gp.pan_deg, gp.tilt_deg); uint16_t w; if (l>0) UART_Send(&uart_dbg,e,(uint16_t)l,&w); }
+                            } else {
+                                { uint8_t e[]="GOTO-FMT/INVALID: goto <0..4>\r\n"; uint16_t w; UART_Send(&uart_dbg,e,sizeof(e)-1,&w); }
+                            }
+                        }
                     }
                 }
                 dbg_cmd_len = 0;
@@ -1009,6 +1149,35 @@ static float DbgCmd_ParseFloat(const char *s, char **end)
 }
 
 /**
+ * @brief 取命令中第 idx 个 (0-based) 空白分隔 token 的起始指针 (NULL=无)
+ * @note  缓冲区须以 '\0' 结尾
+ */
+static const char *DbgCmd_Token(const char *s, int idx)
+{
+    int i;
+    while (*s == ' ' || *s == '\t') s++;
+    for (i = 0; i < idx; i++) {
+        while (*s && *s != ' ' && *s != '\t') s++;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '\0') return NULL;
+    }
+    return (*s) ? s : NULL;
+}
+
+/**
+ * @brief 轴选择: x/X/p/P → Pan, y/Y/t/T → Tilt, 其它 → NULL
+ */
+static MotorPID *DbgCmd_Axis(const char *s)
+{
+    char c;
+    if (s == NULL) return NULL;
+    c = s[0];
+    if (c == 'x' || c == 'X' || c == 'p' || c == 'P') return &pid_pan;
+    if (c == 'y' || c == 'Y' || c == 't' || c == 'T') return &pid_tilt;
+    return NULL;
+}
+
+/**
  * @brief 摆动测试周期驱动 (主循环调用): 按周期切换方向
  *
  * 以启动时的位置为原点, Pan/Tilt 同幅摆动 ±swing_amp,
@@ -1022,8 +1191,8 @@ static void DbgCmd_SwingUpdate(uint32_t now_ms)
         now_ms >= swing_next_ms) {
         swing_dir = -swing_dir;
         swing_next_ms = now_ms + swing_period_ms;
-        MotorPID_SetTarget(&pid_tilt,
-                           swing_tilt_origin + swing_dir * swing_amp);
+        Axis_SetTarget(&axis_tilt,
+                       swing_tilt_origin + swing_dir * swing_amp);
     }
 }
 

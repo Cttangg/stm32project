@@ -150,7 +150,6 @@ int MT6701_Init(MT6701_HandleTypeDef *h, I2C_HandleTypeDef *hi2c) {
     h->last_angle = 0.0f;
     h->turn_cnt   = 0;
     h->is_first   = 1;
-    h->last_raw   = 0xFFFFu;   /* 未初始化标记: 首次读数直接接受 */
     h->mag_ok     = 1;   /* 默认认为磁铁正常, 首次读取后校准 */
     h->last_recover_ms = 0;
 
@@ -167,12 +166,15 @@ int MT6701_Init(MT6701_HandleTypeDef *h, I2C_HandleTypeDef *hi2c) {
 
 uint16_t MT6701_ReadRaw(MT6701_HandleTypeDef *h) {
     uint8_t buf[2];
-    uint16_t raw, delta;
+    uint16_t raw;
+
+    /* ── 非法数据校验 (保留) ──
+       未初始化 / I2C 读失败 → 返回哨兵 0xFFFF (非法值), 调用方据
+       ">360° (719.8°)" 判定本次反馈无效 (Axis/标定均如此).
+       绝不能返回上次有效值 —— 闭环中冻结读数会让 PID 在编码器失效时
+       持续满速驱动 → 电机空转/绕线 (LESSONS L12). */
     if (!h->inited) return 0xFFFFu;
     if (!mt6701_read_reg(h, MT6701_REG_ANGLE_MSB, buf, 2)) {
-        /* 读失败: 返回哨兵 0xFFFF (非法值, 调用方据此判定读失败).
-           注意: 绝不能返回 last_raw —— 闭环中冻结读数会让 PID
-           在编码器失效时继续满速驱动电机 (电机空转/绕线). */
         return 0xFFFFu;
     }
 
@@ -180,22 +182,10 @@ uint16_t MT6701_ReadRaw(MT6701_HandleTypeDef *h) {
     raw = ((uint16_t)buf[0] << 6) | (buf[1] >> 2);
     raw &= 0x3FFF;
 
-    /* 跳变校验: I2C 偶发故障可能读到脏数据 (角度突变).
-       计算与上次值的带环绕最短差, 超过阈值视为脏读数, 丢弃并保持上次值.
-       阈值 = 30° / 0.022° per LSB ≈ 1365 LSB (正常运动 5ms 采样 < 6°, 安全裕量).
-       首读 (last_raw 未初始化 = 0xFFFF) 直接接受.
-       注意: 脏读数也返回哨兵 0xFFFF, 由调用方决定本次更新是否使用 */
-    if (h->last_raw != 0xFFFFu) {
-        delta = (uint16_t)((raw > h->last_raw) ? (raw - h->last_raw) : (h->last_raw - raw));
-        if (delta > MT6701_CPR / 2u) {
-            delta = (uint16_t)(MT6701_CPR - delta);   /* 环绕最短差 */
-        }
-        if (delta > 1365u) {
-            return 0xFFFFu;                           /* 脏读数: 本次无效 */
-        }
-    }
-
-    h->last_raw = raw;
+    /* ── 脏数据 (成功读到但角度突变) 有意不校验 ──
+       驱动层只负责区分"读到 / 读不到", 不判断读数是否连续.
+       原 "与上次值最短差 >30° 视为脏读并返回 0xFFFF" 的过滤已移除;
+       上层 Axis 只做非法值(>360°)判定, 不做连续性校验. */
     return raw;
 }
 

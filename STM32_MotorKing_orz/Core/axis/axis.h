@@ -76,6 +76,7 @@ typedef struct
     AxisState state;
     AxisFault  fault;
     uint8_t    enc_fail_cnt;   /* 编码器连续失败计数 (偶发容忍, 连续失败才 FAULT) */
+    int8_t     dir_sign;       /* 方向符号: 电机转向与编码器读数方向的补偿 (+1/-1) */
 
     /* ── 底层依赖 (由应用层注入) ── */
     MotorPID               *pid;
@@ -106,6 +107,9 @@ void Axis_SetTarget(Axis *axis, float target);
 
 /** @brief 设定角度限位 [min_position, max_position] */
 void Axis_SetLimits(Axis *axis, float min_position, float max_position);
+
+/** @brief 设定方向符号 (+1: 正速度=编码器读数增大; -1: 反之), 统一由 Axis 层补偿 */
+void Axis_SetDirectionSign(Axis *axis, int8_t sign);
 
 /** @brief 周期更新 (主循环调用): 读编码器 → PID → 驱动步进 */
 void Axis_Update(Axis *axis, float dt);

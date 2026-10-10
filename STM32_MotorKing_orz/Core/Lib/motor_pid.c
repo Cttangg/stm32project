@@ -52,6 +52,27 @@ void MotorPID_SetGains(MotorPID *p, float kp, float ki, float kd) {
     p->kp = kp; p->ki = ki; p->kd = kd;
 }
 
+void MotorPID_SetSpeedLimit(MotorPID *p, float max_speed, float max_accel) {
+    if (max_speed > 0.0f) p->max_speed = max_speed;
+    if (max_accel > 0.0f) p->max_accel = max_accel;
+}
+
+void MotorPID_SetDeadband(MotorPID *p, float enter, float exit,
+                          float comp_max_err, float stiction_comp) {
+    if (enter >= 0.0f && exit >= enter) {
+        p->deadband_enter = enter;
+        p->deadband_exit  = exit;
+    }
+    if (comp_max_err >= 0.0f) p->comp_max_err = comp_max_err;
+    if (stiction_comp >= 0.0f) p->stiction_comp = stiction_comp;
+}
+
+void MotorPID_SetDFilter(MotorPID *p, float d_alpha) {
+    if (d_alpha < 0.0f) d_alpha = 0.0f;
+    if (d_alpha > 1.0f) d_alpha = 1.0f;
+    p->d_alpha = d_alpha;
+}
+
 void MotorPID_RescaleMicrostep(MotorPID *p, float old_ms, float new_ms) {
     float r = (old_ms > 0.0f) ? (new_ms / old_ms) : 1.0f;
     p->kp        *= r;    /* 同 °/s 响应下, 高细分需更多 steps/s */

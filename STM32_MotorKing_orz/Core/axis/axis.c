@@ -63,6 +63,7 @@ void Axis_Init(Axis *axis,
     axis->state        = AXIS_DISABLED;
     axis->fault        = AXIS_OK;
     axis->enc_fail_cnt = 0;
+    axis->dir_sign     = -1;           /* 实测: 电机正转 → 编码器读数减小 (见 LESSONS L2) */
 }
 
 void Axis_Enable(Axis *axis)
@@ -97,6 +98,11 @@ void Axis_SetLimits(Axis *axis, float min_position, float max_position)
     axis->target_position = axis_clampf(axis->target_position,
                                         axis->min_position,
                                         axis->max_position);
+}
+
+void Axis_SetDirectionSign(Axis *axis, int8_t sign)
+{
+    axis->dir_sign = (sign < 0) ? -1 : 1;
 }
 
 bool Axis_IsInPosition(const Axis *axis)
@@ -141,21 +147,23 @@ void Axis_Update(Axis *axis, float dt)
     }
 
     if (MT6701_IsMagnetOK(axis->encoder) == 0) {
-        /* I2C 偶发故障容忍: 连续失败超过阈值才判定编码器异常 (磁检失败/持续无应答) */
-        if (++axis->enc_fail_cnt >= 3) {
-            axis->fault = AXIS_ERR_ENCODER;
-            axis->state = AXIS_FAULT;
-            axis_stop_output(axis);
-        }
-        return;   /* 本次跳过更新, 保持上次输出 */
+        /* I2C 偶发故障容忍: 连续失败超阈值才停轴输出 (不锁死故障, 读数恢复后自动恢复) */
+        if (++axis->enc_fail_cnt >= 3) axis_stop_output(axis);
+        return;   /* 本次跳过更新 */
     }
-    axis->enc_fail_cnt = 0;
 
     angle = MT6701_ReadDegrees(axis->encoder);
+    if (angle > 360.0f) {
+        /* 哨兵 0xFFFF → 719.8°: 读失败/脏读数, 不能当有效角度使用、也不能保持上次数值
+           (闭环中冻结反馈会让 PID 持续满速驱动 → 空转/绕线, 见 LESSONS L12) */
+        if (++axis->enc_fail_cnt >= 3) axis_stop_output(axis);
+        return;
+    }
+    axis->enc_fail_cnt = 0;
     axis->position = angle;
 
     /* ── 2. 机械限位检测 ── */
-    if (angle <= axis->min_position || angle >= axis->max_position) {
+    if (angle < axis->min_position || angle > axis->max_position) {
         axis->fault = AXIS_ERR_LIMIT;
         axis->state = AXIS_FAULT;
         axis_stop_output(axis);
@@ -177,9 +185,9 @@ void Axis_Update(Axis *axis, float dt)
     axis->velocity        = axis->pid->filtered_vel;   /* deg/s, 测量速度 */
     axis->target_velocity = axis->pid->vel_ref;         /* steps/s → deg/s 由 PID 承担 */
 
-    /* ── 6. 驱动步进 (PID 输出 velocity_ref 交给硬件定时器) ── */
+    /* ── 6. 驱动步进 (PID 输出 vel_ref, 方向符号在 Axis 层统一补偿) ── */
     if (axis->stepper) {
-        MotorStepper_SetVelocity(axis->stepper, axis->pid->vel_ref);
+        MotorStepper_SetVelocity(axis->stepper, axis->dir_sign * axis->pid->vel_ref);
     }
 
     /* ── 7. 到位判定 (误差进入容差) ── */

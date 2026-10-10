@@ -88,6 +88,22 @@ void  MotorPID_Init(MotorPID *p);
 /** @brief 设置 PID 增益 */
 void  MotorPID_SetGains(MotorPID *p, float kp, float ki, float kd);
 
+/** @brief 设置速度/加速度上限 (steps/s, steps/s²); 参数 <=0 则忽略该项 */
+void  MotorPID_SetSpeedLimit(MotorPID *p, float max_speed, float max_accel);
+
+/**
+ * @brief 设置死区/静摩擦补偿参数
+ * @param enter        进入 HOLDING 阈值 deg
+ * @param exit         退出 HOLDING 阈值 deg (需 >= enter, 否则忽略)
+ * @param comp_max_err 死区补偿窗口上界 deg
+ * @param stiction_comp 静摩擦补偿最小速度 steps/s
+ */
+void  MotorPID_SetDeadband(MotorPID *p, float enter, float exit,
+                           float comp_max_err, float stiction_comp);
+
+/** @brief 设置 D 项低通系数 (0~1, 自动钳位) */
+void  MotorPID_SetDFilter(MotorPID *p, float d_alpha);
+
 /**
  * @brief 切换细分后按比例重标定 kp / max_speed / max_accel
  *        (保持物理行为一致: 1/64 下同样的 rev/s 需要更多 steps/s)

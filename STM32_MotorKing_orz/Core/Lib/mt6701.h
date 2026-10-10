@@ -61,7 +61,6 @@ typedef struct {
     float             last_angle; /* 多圈跟踪: 上次角度 */
     int32_t           turn_cnt;   /* 多圈跟踪: 累计整圈数 */
     uint8_t           is_first;   /* 多圈跟踪: 首读标志 */
-    uint16_t          last_raw;   /* 最近一次成功读取的原始值 (读失败时保持) */
     uint8_t           mag_ok;     /* 最近一次磁检判定结果 (读失败时保持) */
     uint32_t          last_recover_ms;  /* 上次总线恢复时刻 (限频 1s) */
 } MT6701_HandleTypeDef;
