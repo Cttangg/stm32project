@@ -165,6 +165,17 @@ int main(void)
 
   /* USER CODE BEGIN Init */
 
+  /* PLLM=0 除零保护：SWD 软复位（-rst）后 PLLCFGR 可能残留 App 的中间态
+     (PLLM=0)，HAL_RCC_GetSysClockFreq 会 64 位除零 HardFault（USART Init 的
+     GetPCLK2Freq 和 HAL_RCC_ClockConfig 都会经过它）。先切回 HSI 再恢复
+     PLLCFGR 复位值，让 SystemClock_Config 从头配置 PLL。 */
+  if ((RCC->PLLCFGR & RCC_PLLCFGR_PLLM) == 0U)
+  {
+    RCC->CFGR &= ~RCC_CFGR_SW;                  /* SYSCLK = HSI */
+    while ((RCC->CFGR & RCC_CFGR_SWS) != 0U) {} /* 等待切换完成 */
+    RCC->PLLCFGR = 0x24003010U;                 /* 复位值: PLLM=16, PLLN=192, PLLSRC=HSI */
+  }
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
